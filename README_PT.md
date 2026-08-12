@@ -181,7 +181,7 @@ As imagens abaixo ficam na mesma pasta dos arquivos `README.md` e `README_EN.md`
 ### Fila de backups EML
 
 <p align="center">
-<img width="1920" height="1041" alt="aba backup  eml" src="https://github.com/user-attachments/assets/2345cbb5-3f6b-4ba5-859a-b7d0c055d27a" />
+<img width="1920" height="1041" alt="aba backup  eml" src="https://github.com/user-attachments/assets/be5d9d6d-28c4-4e0d-b286-4f97aef43c77" />
 </p>
 
 A página **Backups** centraliza a fila das mailboxes, importação por CSV, retomada de backups existentes, configuração de pastas, pausa, retomada e remoção. A tabela apresenta status, etapa atual, quantidade informada pela mailbox, progresso, itens restantes, volume transferido, estimativa de conclusão, pastas selecionadas e posição na fila. O painel inferior exibe o log da mailbox selecionada.
@@ -189,7 +189,7 @@ A página **Backups** centraliza a fila das mailboxes, importação por CSV, ret
 ### Seleção de pastas e opções do backup
 
 <p align="center">
-<img width="1074" height="777" alt="configuração de pasta" src="https://github.com/user-attachments/assets/c22ba9dc-271d-4de0-a95d-b3183d6777f0" />
+<img width="1074" height="777" alt="configuração de pasta" src="https://github.com/user-attachments/assets/27956b8a-89e0-4a73-a47b-eabf5559e34d" />
 </p>
 
 A janela **Pastas e opções** carrega somente a estrutura e os contadores das pastas antes do backup. É possível selecionar todas as pastas, limpar a seleção, aplicar uma seleção recomendada, definir opções de conteúdo, ignorar calendário, contatos e tarefas, limitar mensagens por pasta e aplicar a configuração à fila inteira.
@@ -199,7 +199,7 @@ A janela **Pastas e opções** carrega somente a estrutura e os contadores das p
 ### Fila de conversões PST
 
 <p align="center">
-<img width="1920" height="1039" alt="conversoes pst" src="https://github.com/user-attachments/assets/83ef2fa4-4c74-44da-93ba-f6fc946114df" />
+<img width="1920" height="1039" alt="conversoes pst" src="https://github.com/user-attachments/assets/20ed5b84-d78f-46a6-b901-1062e94d10d5" />
 </p>
 
 A página **Conversões PST** permite criar novas conversões, iniciar somente os itens selecionados, pausar, retomar, remover e abrir o destino. A tabela mostra origem, destino, nome exibido no Outlook, política para arquivos existentes, progresso, verificação, falhas e itens restantes.
@@ -207,7 +207,7 @@ A página **Conversões PST** permite criar novas conversões, iniciar somente o
 ### Configurações e credenciais
 
 <p align="center">
-<img width="1920" height="1039" alt="config imagem" src="https://github.com/user-attachments/assets/7e08dbae-7e4e-4443-ba47-03e7fee2e585" />
+<img width="1920" height="1039" alt="config imagem" src="https://github.com/user-attachments/assets/b85b0b04-c947-4af0-a11b-3358b03ed7e1" />
 </p>
 
 A página **Configurações** reúne preferências gerais, credenciais do Microsoft Entra ID, parâmetros operacionais e aparência. O segredo do cliente permanece oculto e pode ser mantido sem redigitação. O botão **Salvar e testar credenciais** valida a autenticação antes de iniciar operações.
