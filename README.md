@@ -181,7 +181,7 @@ The images below are stored beside `README.md` and `README_EN.md`. GitHub, VS Co
 ### EML backup queue
 
 <p align="center">
-<img width="1920" height="1041" alt="aba backup  eml" src="https://github.com/user-attachments/assets/2345cbb5-3f6b-4ba5-859a-b7d0c055d27a" />
+<img width="1920" height="1041" alt="aba backup  eml" src="https://github.com/user-attachments/assets/075c0948-36d6-464b-bb47-45975652cd79" />
 </p>
 
 The **Backups** page centralizes the mailbox queue, CSV import, existing-backup resume, folder configuration, pause, resume, and removal actions. The table shows status, current stage, mailbox-reported count, progress, remaining items, transferred volume, completion estimate, selected folders, and queue position. The lower panel displays the log for the selected mailbox.
@@ -189,7 +189,7 @@ The **Backups** page centralizes the mailbox queue, CSV import, existing-backup 
 ### Folder selection and backup options
 
 <p align="center">
-<img width="1074" height="777" alt="configuração de pasta" src="https://github.com/user-attachments/assets/c22ba9dc-271d-4de0-a95d-b3183d6777f0" />
+<img width="1074" height="777" alt="configuração de pasta" src="https://github.com/user-attachments/assets/279af4bd-1d73-4cde-ac2c-4f2a2d10fb86" />
 </p>
 
 The **Folders and options** dialog loads only the folder hierarchy and counters before a backup starts. Operators can select every folder, clear the selection, apply a recommended selection, configure content options, skip calendar, contacts, and tasks, set a per-folder message limit, and apply the configuration to the whole queue.
@@ -199,7 +199,7 @@ The **Folders and options** dialog loads only the folder hierarchy and counters 
 ### PST conversion queue
 
 <p align="center">
-<img width="1920" height="1039" alt="conversoes pst" src="https://github.com/user-attachments/assets/83ef2fa4-4c74-44da-93ba-f6fc946114df" />
+<img width="1920" height="1039" alt="conversoes pst" src="https://github.com/user-attachments/assets/7fee2869-9534-4558-a32e-a525cebf1f15" />
 </p>
 
 The **PST Conversions** page supports creating conversions, starting selected jobs, pausing, resuming, removing, and opening the destination. The table shows source, destination, Outlook display name, existing-file policy, progress, verification, failures, and remaining items.
@@ -207,7 +207,7 @@ The **PST Conversions** page supports creating conversions, starting selected jo
 ### Settings and credentials
 
 <p align="center">
-<img width="1920" height="1039" alt="config imagem" src="https://github.com/user-attachments/assets/7e08dbae-7e4e-4443-ba47-03e7fee2e585" />
+<img width="1920" height="1039" alt="config imagem" src="https://github.com/user-attachments/assets/c7f44769-d4cf-47db-80e6-638bf8714c5d" />
 </p>
 
 The **Settings** page groups general preferences, Microsoft Entra ID credentials, operational parameters, and appearance. The client secret remains hidden and can be preserved without re-entering it. **Save and test credentials** validates authentication before operations begin.
