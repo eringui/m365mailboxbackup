@@ -6,6 +6,9 @@ import threading
 import random
 import sqlite3
 import math
+import json
+import traceback
+import hashlib
 
 from requests.adapters import HTTPAdapter
 from pathlib import Path
@@ -1190,125 +1193,166 @@ class GraphService:
 
         return validation_result
 
-    def download_message_mime_to_file(
-        self,
-        mailbox_email,
-        message_id,
-        destination_path,
-        retry_count=0
-    ):
-        """Stream one MIME message atomically while limiting the full transfer.
-
-        A MIME slot now remains occupied until the response body has been written,
-        so configured concurrency represents actual downloads instead of only the
-        time spent waiting for HTTP headers.
-        """
-        message_id_encoded = self._encode_id(message_id)
-        endpoint = (
-            f"/users/{mailbox_email}"
-            f"/messages/{message_id_encoded}"
-            f"/$value"
-        )
-        url = self._normalize_endpoint(endpoint)
+    @staticmethod
+    def _compact_destination_path(destination_path, max_total=180, hash_only=False):
         destination_path = Path(destination_path)
-        temporary_path = destination_path.with_suffix(destination_path.suffix + ".part")
-        temporary_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path.unlink(missing_ok=True)
-        attempt = max(0, int(retry_count or 0))
+        suffix = ".eml"
+        digest = hashlib.sha256(str(destination_path).encode("utf-8", "replace")).hexdigest()[:16]
+        if hash_only:
+            sequence = destination_path.name.split("_", 1)[0]
+            return destination_path.parent / f"{sequence}_{digest}{suffix}"
+        if len(str(destination_path)) + len(".part") <= max_total:
+            return destination_path
+        parent_length = len(str(destination_path.parent))
+        budget = max(12, max_total - parent_length - len(suffix) - len(digest) - 3)
+        stem = destination_path.stem
+        return destination_path.parent / f"{stem[:budget].rstrip(' ._')}_{digest}{suffix}"
 
-        while True:
-            self._wait_for_shared_throttle()
-            self._wait_for_pyrate_limit(mailbox_email)
-            self._wait_for_mime_rate_slot()
-            self._acquire_mime_slot()
-            response = None
-            request_started_at = time.perf_counter()
+    @staticmethod
+    def _filesystem_diagnostic(error, stage, requested_path, effective_path, temporary_path):
+        effective_path = Path(effective_path)
+        temporary_path = Path(temporary_path)
+        parent = temporary_path.parent
+        try:
+            parent_exists = parent.exists()
+        except Exception:
+            parent_exists = None
+        try:
+            parent_is_dir = parent.is_dir()
+        except Exception:
+            parent_is_dir = None
+        return {
+            "stage": stage,
+            "exception_type": type(error).__name__,
+            "message": str(error),
+            "repr": repr(error),
+            "errno": getattr(error, "errno", None),
+            "winerror": getattr(error, "winerror", None),
+            "filename": getattr(error, "filename", None),
+            "filename2": getattr(error, "filename2", None),
+            "requested_path": str(requested_path),
+            "requested_length": len(str(requested_path)),
+            "effective_path": str(effective_path),
+            "effective_length": len(str(effective_path)),
+            "temporary_path": str(temporary_path),
+            "temporary_length": len(str(temporary_path)),
+            "parent": str(parent),
+            "parent_exists": parent_exists,
+            "parent_is_dir": parent_is_dir,
+            "cwd": os.getcwd(),
+            "operation_id": os.getenv("M365_OPERATION_ID", ""),
+            "traceback": traceback.format_exc(),
+        }
+
+    def download_message_mime_to_file(
+        self, mailbox_email, message_id, destination_path, retry_count=0
+    ):
+        """Baixa MIME atomicamente, diagnostica cada estágio e usa fallback curto."""
+        requested_path = Path(destination_path)
+        candidates = [
+            self._compact_destination_path(requested_path, max_total=180),
+            self._compact_destination_path(requested_path, max_total=180, hash_only=True),
+        ]
+        # Remove duplicados mantendo ordem.
+        unique_candidates = []
+        for candidate in candidates:
+            if candidate not in unique_candidates:
+                unique_candidates.append(candidate)
+        message_id_encoded = self._encode_id(message_id)
+        url = self._normalize_endpoint(
+            f"/users/{mailbox_email}/messages/{message_id_encoded}/$value"
+        )
+        last_diagnostic = None
+        for candidate_index, effective_path in enumerate(unique_candidates, 1):
+            temporary_path = effective_path.with_suffix(effective_path.suffix + ".part")
+            stage = "prepare_parent"
             try:
-                response = self._get_thread_session().get(
-                    url,
-                    headers=self.get_headers(),
-                    timeout=(30, 180),
-                    stream=True,
-                )
-                if response.status_code == 401 and attempt == 0:
-                    self.access_token = None
-                    self.authenticate()
-                    attempt += 1
-                    continue
-                if response.status_code == 429 and attempt < 6:
-                    try:
-                        retry_after = int(response.headers.get("Retry-After", "10"))
-                    except (TypeError, ValueError):
-                        retry_after = 10
-                    wait_seconds = self._register_mime_throttle(retry_after)
-                    self.logger.warning(
-                        "Throttling MIME detectado. "
-                        f"Aguardando {wait_seconds:.1f} segundos com margem de segurança..."
-                    )
-                    attempt += 1
-                    continue
-                if response.status_code in (500, 502, 503, 504) and attempt < 3:
-                    wait_seconds = 5 * (attempt + 1)
-                    attempt += 1
-                    time.sleep(wait_seconds)
-                    continue
-                if response.status_code < 200 or response.status_code >= 300:
-                    error_text = response.text
-                    self._record_metric(
-                        url, response, request_started_at, attempt, raw=False
-                    )
-                    return {
-                        "success": False,
-                        "status_code": response.status_code,
-                        "path": None,
-                        "bytes_written": 0,
-                        "error": error_text,
-                    }
-
-                bytes_written = 0
-                with open(temporary_path, "wb") as file:
-                    for chunk in response.iter_content(
-                        chunk_size=EML_DOWNLOAD_CHUNK_SIZE
-                    ):
-                        if not chunk:
-                            continue
-                        file.write(chunk)
-                        bytes_written += len(chunk)
-                    file.flush()
-                    os.fsync(file.fileno())
-                self._record_metric(
-                    url, response, request_started_at, attempt, raw=False
-                )
-                if bytes_written <= 0:
-                    temporary_path.unlink(missing_ok=True)
-                    return {
-                        "success": False,
-                        "status_code": response.status_code,
-                        "path": None,
-                        "bytes_written": 0,
-                        "error": "O Graph retornou conteúdo MIME vazio.",
-                    }
-                os.replace(temporary_path, destination_path)
-                return {
-                    "success": True,
-                    "status_code": response.status_code,
-                    "path": str(destination_path),
-                    "bytes_written": bytes_written,
-                    "error": None,
-                }
-            except Exception as error:
+                temporary_path.parent.mkdir(parents=True, exist_ok=True)
+                stage = "remove_stale_part"
                 temporary_path.unlink(missing_ok=True)
-                return {
-                    "success": False,
-                    "status_code": 0,
-                    "path": None,
-                    "bytes_written": 0,
-                    "error": str(error),
-                }
-            finally:
-                if response is not None:
-                    response.close()
-                self._release_mime_slot()
+            except Exception as error:
+                last_diagnostic = self._filesystem_diagnostic(
+                    error, stage, requested_path, effective_path, temporary_path
+                )
+                last_diagnostic["candidate"] = candidate_index
+                self.logger.error("[ROOT-CAUSE] %s", json.dumps(last_diagnostic, ensure_ascii=False))
+                continue
+
+            attempt = max(0, int(retry_count or 0))
+            while True:
+                self._wait_for_shared_throttle()
+                self._wait_for_pyrate_limit(mailbox_email)
+                self._wait_for_mime_rate_slot()
+                self._acquire_mime_slot()
+                response = None
+                request_started_at = time.perf_counter()
+                try:
+                    stage = "http_get"
+                    response = self._get_thread_session().get(
+                        url, headers=self.get_headers(), timeout=(30, 180), stream=True
+                    )
+                    if response.status_code == 401 and attempt == 0:
+                        self.access_token = None; self.authenticate(); attempt += 1; continue
+                    if response.status_code == 429 and attempt < 6:
+                        try: retry_after = int(response.headers.get("Retry-After", "10"))
+                        except (TypeError, ValueError): retry_after = 10
+                        wait_seconds = self._register_mime_throttle(retry_after)
+                        self.logger.warning("Throttling MIME: aguardando %.1f segundos.", wait_seconds)
+                        attempt += 1; continue
+                    if response.status_code in (500, 502, 503, 504) and attempt < 3:
+                        time.sleep(5 * (attempt + 1)); attempt += 1; continue
+                    if not 200 <= response.status_code < 300:
+                        error_text = response.text
+                        self._record_metric(url, response, request_started_at, attempt, raw=False)
+                        diagnostic={"stage":"http_status","status_code":response.status_code,
+                            "response_excerpt":error_text[:2000],"url":url,"message_id":message_id}
+                        self.logger.error("[ROOT-CAUSE] %s",json.dumps(diagnostic,ensure_ascii=False))
+                        return {"success":False,"status_code":response.status_code,"path":None,
+                            "bytes_written":0,"error":error_text,"diagnostic":diagnostic}
+                    bytes_written = 0
+                    stage = "open_temporary"
+                    with open(temporary_path, "wb") as file:
+                        stage = "stream_write"
+                        for chunk in response.iter_content(chunk_size=EML_DOWNLOAD_CHUNK_SIZE):
+                            if chunk:
+                                file.write(chunk); bytes_written += len(chunk)
+                        stage = "flush_fsync"
+                        file.flush(); os.fsync(file.fileno())
+                    self._record_metric(url, response, request_started_at, attempt, raw=False)
+                    if bytes_written <= 0:
+                        temporary_path.unlink(missing_ok=True)
+                        return {"success":False,"status_code":response.status_code,"path":None,
+                            "bytes_written":0,"error":"O Graph retornou MIME vazio.",
+                            "diagnostic":{"stage":"empty_mime","status_code":response.status_code}}
+                    stage = "atomic_replace"
+                    os.replace(temporary_path, effective_path)
+                    if candidate_index > 1 or effective_path != requested_path:
+                        self.logger.warning("Caminho EML compactado: original=%s (%s) final=%s (%s)",
+                            requested_path,len(str(requested_path)),effective_path,len(str(effective_path)))
+                    return {"success":True,"status_code":response.status_code,"path":str(effective_path),
+                        "bytes_written":bytes_written,"error":None,
+                        "diagnostic":{"stage":"completed","candidate":candidate_index,
+                            "requested_length":len(str(requested_path)),"effective_length":len(str(effective_path))}}
+                except Exception as error:
+                    try: temporary_path.unlink(missing_ok=True)
+                    except Exception: pass
+                    last_diagnostic = self._filesystem_diagnostic(
+                        error, stage, requested_path, effective_path, temporary_path
+                    )
+                    last_diagnostic.update({"candidate":candidate_index,"status_code":getattr(response,"status_code",0),
+                        "message_id":message_id,"mailbox":mailbox_email})
+                    self.logger.error("[ROOT-CAUSE] %s", json.dumps(last_diagnostic, ensure_ascii=False))
+                    # Erros locais de arquivo tentam o candidato hash-only.
+                    if isinstance(error, OSError) and candidate_index < len(unique_candidates):
+                        break
+                    return {"success":False,"status_code":getattr(response,"status_code",0) or 0,
+                        "path":None,"bytes_written":0,"error":str(error),"diagnostic":last_diagnostic}
+                finally:
+                    if response is not None: response.close()
+                    self._release_mime_slot()
+        return {"success":False,"status_code":0,"path":None,"bytes_written":0,
+            "error":(last_diagnostic or {}).get("message","Falha ao preparar o destino EML."),
+            "diagnostic":last_diagnostic or {"stage":"unknown"}}
 
     def get_message_mime_content(self, mailbox_email, message_id):
         message_id_encoded = self._encode_id(message_id)

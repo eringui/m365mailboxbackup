@@ -115,6 +115,22 @@ class CheckpointStore:
 
             CREATE INDEX IF NOT EXISTS idx_folder_sync_status
             ON folder_sync_state(status);
+            CREATE TABLE IF NOT EXISTS repair_history (
+                repair_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_key TEXT NOT NULL,
+                folder_id TEXT,
+                success INTEGER NOT NULL DEFAULT 0,
+                previous_error TEXT,
+                new_error TEXT,
+                original_output_path TEXT,
+                final_output_path TEXT,
+                bytes_written INTEGER NOT NULL DEFAULT 0,
+                diagnostic_json TEXT NOT NULL DEFAULT '{}',
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_repair_history_item
+            ON repair_history(item_key, repair_id);
             """
         )
         # Migração incremental e idempotente para checkpoints criados antes
@@ -389,7 +405,7 @@ class CheckpointStore:
                 destination_store_id=COALESCE(excluded.destination_store_id, items.destination_store_id),
                 destination_folder=COALESCE(excluded.destination_folder, items.destination_folder),
                 verification_status=COALESCE(excluded.verification_status, items.verification_status),
-                status='failed', error=excluded.error, updated_at=excluded.updated_at
+                status='failed', attempts=items.attempts + 1, error=excluded.error, last_attempt_at=excluded.updated_at, updated_at=excluded.updated_at
             """,
             (
                 str(item_key), metadata.get("relative_path"), metadata.get("file_size"),
@@ -660,6 +676,36 @@ class CheckpointStore:
             "partial_file_count": len(partial_files),
             "partial_files": partial_files[:100]
         }
+
+    def failed_items(self, retryable_only=True):
+        sql = "SELECT * FROM items WHERE status = 'failed'"
+        params = []
+        if retryable_only:
+            sql += " AND COALESCE(retryable, 1) = 1"
+        sql += " ORDER BY COALESCE(sequence_number, 2147483647), updated_at"
+        return [dict(row) for row in self.connection().execute(sql, tuple(params))]
+
+    def record_repair(self, item_key, success, previous_error=None, new_error=None,
+                      folder_id=None, original_output_path=None, final_output_path=None,
+                      bytes_written=0, diagnostic=None, started_at=None, finished_at=None):
+        now = datetime.now().isoformat()
+        self.connection().execute(
+            """INSERT INTO repair_history (
+                item_key, folder_id, success, previous_error, new_error,
+                original_output_path, final_output_path, bytes_written,
+                diagnostic_json, started_at, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (str(item_key), folder_id, 1 if success else 0, previous_error, new_error,
+             original_output_path, final_output_path, max(0, int(bytes_written or 0)),
+             json.dumps(diagnostic or {}, ensure_ascii=False), started_at or now,
+             finished_at or now)
+        )
+
+    def repair_history(self, limit=500):
+        return [dict(row) for row in self.connection().execute(
+            "SELECT * FROM repair_history ORDER BY repair_id DESC LIMIT ?",
+            (max(1, int(limit)),)
+        )]
 
     def compact(self):
         connection = self.connection()

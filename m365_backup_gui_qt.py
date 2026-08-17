@@ -844,6 +844,13 @@ class M365BackupWindow(QMainWindow):
             )
             for _ in range(30):
                 time.sleep(0.1)
+                # Mantém a UI respondendo durante a espera pelo coordenador
+                # (até 3s): sem isso, o Windows chega a marcar a janela como
+                # "Não está respondendo" logo na abertura do app ou sempre
+                # que o coordenador precisa ser reiniciado no meio da sessão.
+                application = QApplication.instance()
+                if application is not None:
+                    application.processEvents()
                 try:
                     health = self.coordinator_request("GET", "/health", timeout=0.4) or {}
                     self.coordinator_pid = safe_int(health.get("coordinator_pid"))
@@ -897,7 +904,11 @@ class M365BackupWindow(QMainWindow):
                 item.get("operation_id"), item.get("status"),
                 safe_int(item.get("current_items")), safe_int(item.get("total_items")),
                 safe_int(item.get("failed_items")), safe_int(item.get("downloaded_bytes")),
-                item.get("current_folder"), safe_int(item.get("current_page"))
+                item.get("current_folder"), safe_int(item.get("current_page")),
+                safe_int(item.get("pst_pending_verifications")),
+                safe_int(item.get("pst_verified_items")),
+                safe_int(item.get("pst_saved_items")),
+                safe_int(item.get("pst_audit_failures"))
             )
             for item in operations
         )
@@ -1059,7 +1070,10 @@ class M365BackupWindow(QMainWindow):
                 backup_order.append(mailbox)
                 seen_backup.add(mailbox)
                 existing = self.backup_jobs.get(mailbox, {})
-                reported_current = safe_int(operation.get("current_items"))
+                reported_current = max(
+                    safe_int(operation.get("current_items")),
+                    safe_int(existing.get("current")),
+                )
                 incoming_status = self.display_status(operation.get("status"))
                 if (
                     existing.get("resume_path")
@@ -1077,10 +1091,10 @@ class M365BackupWindow(QMainWindow):
                     "operation_id": operation_id,
                     "status": incoming_status,
                     "current": reported_current,
-                    "expected": (
-                        safe_int(operation.get("total_items"))
-                        or safe_int(existing.get("expected"))
-                        or safe_int(existing.get("mailbox_total"))
+                    "expected": max(
+                        safe_int(operation.get("total_items")),
+                        safe_int(existing.get("expected")),
+                        reported_current,
                     ),
                     "downloaded_bytes": safe_int(operation.get("downloaded_bytes")),
                     "rate_limiter_profile": operation.get("rate_limiter_profile"),
@@ -1360,6 +1374,7 @@ class M365BackupWindow(QMainWindow):
             ("Iniciar backups", self.start_queue, True),
             ("Pausar", self.pause_selected_backup, False),
             ("Retomar", self.resume_selected_backup, False),
+            ("Corrigir falhas", self.repair_selected_backup, True),
             ("Remover", self.remove_selected_backup, False)
         ):
             button = QPushButton(text)
@@ -2786,6 +2801,22 @@ class M365BackupWindow(QMainWindow):
         thread.start()
 
     def handle_backup_line(self, mailbox, line):
+        repair_marker = "[REPAIR-PROGRESS] "
+        if repair_marker in line:
+            try:
+                payload = json.loads(line.split(repair_marker, 1)[1].strip())
+                job = self.backup_jobs[mailbox]
+                job["resume_stage"] = (
+                    f"Corrigindo falhas · {safe_int(payload.get('current'))}/"
+                    f"{safe_int(payload.get('total'))}"
+                )
+                job["repair_recovered"] = safe_int(payload.get("recovered"))
+                job["repair_failed"] = safe_int(payload.get("failed"))
+                self.append_mailbox_log(mailbox, job["resume_stage"])
+                self.schedule_backup_render()
+            except Exception as error:
+                self.log_event("Progresso de correção inválido.", "Aviso", str(error))
+            return
         marker = "[PROGRESS] "
         if marker in line:
             try:
@@ -2841,6 +2872,63 @@ class M365BackupWindow(QMainWindow):
         self.render_backup_table()
         self.save_state()
 
+    def repair_selected_backup(self):
+        selected = self.selected_backup_mailboxes()
+        if not selected:
+            QMessageBox.information(self, "Corrigir falhas", "Selecione uma mailbox.")
+            return
+        if len(selected) > 1:
+            QMessageBox.information(self, "Corrigir falhas", "Selecione apenas uma mailbox por vez.")
+            return
+        mailbox = selected[0]
+        job = self.backup_jobs.get(mailbox, {})
+        if job.get("status") in STATUS_RUNNING or job.get("status") in {"iniciando", "pausando"}:
+            QMessageBox.warning(self, "Corrigir falhas", "Pause o backup antes de iniciar a correção.")
+            return
+        backup_path = Path(job.get("resume_path") or self.stable_backup_path(mailbox))
+        if not (backup_path / "checkpoint.json").is_file():
+            QMessageBox.warning(self, "Corrigir falhas", "O checkpoint do backup não foi encontrado.")
+            return
+        checkpoint = self.read_checkpoint_progress(backup_path)
+        answer = QMessageBox.question(
+            self, "Corrigir falhas",
+            "O sistema tentará novamente somente os EML ainda com falha, sem enumerar "
+            "toda a mailbox. Deseja continuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not self.ensure_coordinator():
+            QMessageBox.critical(self, "Coordenador", "O serviço local não está disponível.")
+            return
+        command = (
+            [str(self.project_root / "run_backend.exe")]
+            if getattr(sys, "frozen", False)
+            else [sys.executable, "-m", "src.main"]
+        )
+        command += ["--repair-failures", "--resume-path", str(backup_path), "--mailbox", mailbox]
+        try:
+            operation = self.coordinator_request("POST", "/operations", {
+                "operation_type": "backup", "mailbox": mailbox,
+                "command": command, "backup_path": str(backup_path),
+                "destination_path": self.destination_edit.text(),
+                "options": {
+                    "operation_mode": "repair_failures",
+                    "runtime_settings": self.app_settings.snapshot_for_operation("backup", {})
+                }
+            })
+            job["operation_id"] = operation.get("operation_id")
+            job["status"] = "iniciando"
+            job["resume_stage"] = "Lendo falhas do checkpoint"
+            job["repair_recovered"] = 0
+            job["repair_failed"] = safe_int(checkpoint.get("failed", 0))
+            self.append_mailbox_log(mailbox, "Correção rápida iniciada; somente falhas serão processadas.")
+            self.render_backup_table()
+            self.save_state()
+        except Exception as error:
+            QMessageBox.critical(self, "Corrigir falhas", str(error))
+
     def pause_selected_backup(self):
         for mailbox in self.selected_backup_mailboxes():
             operation_id = self.backup_jobs.get(mailbox, {}).get("operation_id")
@@ -2871,9 +2959,16 @@ class M365BackupWindow(QMainWindow):
         self.save_state()
 
     def apply_dragged_backup_order(self, visible_order):
-        if self.backup_filter.text().strip():
+        if self.backup_filter.text().strip() or self.backup_status_filter.currentData():
+            # visible_order só contém as linhas atualmente exibidas na tabela;
+            # com um filtro de status ativo, isso é um subconjunto — recalcular
+            # backup_order a partir dele empurraria todo o resto da fila
+            # (inclusive operações em execução) para o fim, silenciosamente.
             self.render_backup_table()
-            QMessageBox.information(self, "Ordem da fila", "Limpe a busca antes de arrastar a fila.")
+            QMessageBox.information(
+                self, "Ordem da fila",
+                "Limpe a busca e o filtro de status antes de arrastar a fila."
+            )
             return
         tail = [mailbox for mailbox in self.backup_order if mailbox not in visible_order]
         self.backup_order = list(visible_order) + tail
@@ -2898,11 +2993,12 @@ class M365BackupWindow(QMainWindow):
         if not selected:
             QMessageBox.information(self, "Ordem da fila", "Selecione uma ou mais mailboxes.")
             return
-        if self.backup_filter.text().strip():
+        if self.backup_filter.text().strip() or self.backup_status_filter.currentData():
             QMessageBox.information(
                 self,
                 "Ordem da fila",
-                "Limpe a busca antes de alterar a ordem para visualizar a fila completa."
+                "Limpe a busca e o filtro de status antes de alterar a ordem "
+                "para visualizar a fila completa."
             )
             return
 
@@ -3054,6 +3150,7 @@ class M365BackupWindow(QMainWindow):
             ("Configurar pastas e opções", self.configure_selected_backup),
             ("Pausar", self.pause_selected_backup),
             ("Retomar", self.resume_selected_backup),
+            ("Corrigir somente falhas", self.repair_selected_backup),
             ("Subir na fila", self.move_selected_backup_up),
             ("Descer na fila", self.move_selected_backup_down),
             ("Mover para o topo", self.move_selected_backup_top),
@@ -3298,22 +3395,35 @@ class M365BackupWindow(QMainWindow):
         if not options.get("import_attachments", True): command.append("--skip-attachments")
         if options.get("detach_after", self.pst_detach.isChecked()):
             command.append("--detach-after")
-        operation = self.coordinator_request("POST", "/operations", {
-            "operation_type": "pst", "command": command,
-            "source_path": backup,
-            "destination_path": pst,
-            "options": {
-                **options, "manual_start": options.get("manual_start", True),
-                "runtime_settings": self.app_settings.snapshot_for_operation("pst", options)
-            }
-        })
-        if not isinstance(operation, dict):
-            raise RuntimeError("O coordenador não retornou a operação PST criada.")
-        self.log_event(
-            f"Conversão {operation['operation_id']} adicionada com snapshot operacional da GUI. "
-            "Selecione-a e clique em Iniciar selecionadas."
-        )
-        self.refresh_from_coordinator()
+        try:
+            operation = self.coordinator_request("POST", "/operations", {
+                "operation_type": "pst", "command": command,
+                "source_path": backup,
+                "destination_path": pst,
+                "options": {
+                    **options, "manual_start": options.get("manual_start", True),
+                    "runtime_settings": self.app_settings.snapshot_for_operation("pst", options)
+                }
+            })
+            if not isinstance(operation, dict):
+                raise RuntimeError("O coordenador não retornou a operação PST criada.")
+            self.log_event(
+                f"Conversão {operation['operation_id']} adicionada com snapshot operacional da GUI. "
+                "Selecione-a e clique em Iniciar selecionadas."
+            )
+            self.refresh_from_coordinator()
+        except Exception as error:
+            # Sem isso, uma conversão PST duplicada (ex.: clique duplo antes do
+            # próximo poll atualizar self.pst_jobs) virava um HTTP 500 que
+            # subia sem tratamento até aqui e desaparecia só no crash log,
+            # sem nenhum aviso na tela.
+            QMessageBox.critical(
+                self, "Conversão PST",
+                f"Não foi possível adicionar a conversão à fila.\n\n{error}"
+            )
+            self.log_event(
+                "Falha ao adicionar conversão PST à fila.", "Erro", str(error)
+            )
 
     def start_selected_pst(self):
         selected = self.selected_pst_ids()

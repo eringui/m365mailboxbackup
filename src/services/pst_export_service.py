@@ -13,6 +13,7 @@ import html
 import hashlib
 import gc
 import re
+import shutil
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -26,10 +27,16 @@ except ImportError:
 
 try:
     from src.services.checkpoint_store import CheckpointStore
-    from src.utils.logger import setup_pst_logger
+    from src.utils.logger import setup_pst_logger, setup_logger, setup_report_logger
 except ImportError:
     from checkpoint_store import CheckpointStore
-    from logger import setup_pst_logger
+    from logger import setup_pst_logger, setup_logger, setup_report_logger
+
+_report_logger = setup_report_logger()
+
+
+def _report(message=""):
+    _report_logger.info(message)
 
 
 
@@ -123,6 +130,7 @@ class PstExportService:
             "M365_PST_RESUME_FIRST_COMMIT_TARGET_SECONDS", 10.0, 1.0, 120.0
         )
         self.capacity_preflight = os.getenv("M365_PST_CAPACITY_PREFLIGHT", "1").strip().lower() not in {"0", "false", "no", "off"}
+        self.disk_critical_gb = self._env_float("M365_DISK_CRITICAL_GB", 10, 1, 100000)
         self.retry_failed_on_resume = os.getenv("M365_PST_RETRY_FAILED_ON_RESUME", "1").strip().lower() not in {"0", "false", "no", "off"}
         self._resume_started_at = 0.0
         self._resume_metrics = {
@@ -174,15 +182,11 @@ class PstExportService:
         self.pst_logger.info(message)
         if self.logger:
             self.logger.info(message)
-        else:
-            print(message, flush=True)
 
     def log_error(self, message):
         self.pst_logger.error(message)
         if self.logger:
             self.logger.error(message)
-        else:
-            print(f"ERROR: {message}", flush=True)
 
     def log_stage(self, category, message, **details):
         payload = {"category": category, "message": message, **details}
@@ -194,6 +198,27 @@ class PstExportService:
             return
         self.log_info(structured)
         self.log_info(f"[PST-STAGE] {message}")
+
+    def ensure_disk_capacity(self, pst_path):
+        """Abort early when free disk space drops below the critical threshold.
+
+        M365_PST_CAPACITY_PREFLIGHT existed as a flag but had no actual disk
+        check anywhere; PstCapacityError plugs into the same checkpoint-preserving
+        abort path already used for "PST reached its maximum size" COM errors.
+        """
+        if not self.capacity_preflight:
+            return
+        try:
+            usage = shutil.disk_usage(str(Path(pst_path).resolve().parent))
+        except OSError:
+            return
+        free_gb = usage.free / (1024 ** 3)
+        if free_gb < self.disk_critical_gb:
+            raise PstCapacityError(
+                f"Espaço livre em disco insuficiente para continuar a gravação do "
+                f"PST: {free_gb:.1f} GB livres, limite crítico configurado é "
+                f"{self.disk_critical_gb:.0f} GB (M365_DISK_CRITICAL_GB)."
+            )
 
     def acquire_destination_lock(self, pst_path):
         pst_path = self.normalize_path(pst_path)
@@ -218,11 +243,12 @@ class PstExportService:
                     pid = int(data.get("pid", 0) or 0)
                     if pid <= 0:
                         stale = True
-                    else:
-                        try:
-                            os.kill(pid, 0)
-                        except OSError:
-                            stale = True
+                    elif psutil is not None and not psutil.pid_exists(pid):
+                        # No Windows, os.kill(pid, 0) não é uma verificação
+                        # inofensiva: ele chama TerminateProcess(pid, 0) e
+                        # mataria de fato um processo real com esse PID.
+                        # psutil.pid_exists() apenas consulta, sem matar nada.
+                        stale = True
                 except Exception:
                     stale = True
                 if stale and attempt == 0:
@@ -1193,11 +1219,31 @@ class PstExportService:
                             self.MAPI_PROPS["attachment_flags"],
                             4
                         )
-                except Exception:
-                    pass
+                except Exception as metadata_error:
+                    self.log_error(
+                        "[PST-EVENT] " + json.dumps(
+                            {
+                                "category": "attachment_metadata_error",
+                                "message": "Anexo adicionado, mas metadados MAPI não aplicados",
+                                "attachment": str(attachment.get("path")),
+                                "error": str(metadata_error)
+                            },
+                            ensure_ascii=False
+                        )
+                    )
 
-            except Exception:
-                pass
+            except Exception as attachment_error:
+                self.log_error(
+                    "[PST-EVENT] " + json.dumps(
+                        {
+                            "category": "attachment_error",
+                            "message": "Falha ao anexar arquivo ao item do PST; anexo não incluído",
+                            "attachment": str(attachment.get("path")),
+                            "error": str(attachment_error)
+                        },
+                        ensure_ascii=False
+                    )
+                )
 
     def build_source_key(self, backup_root, relative_path, file_size, modified_ns):
         payload = (
@@ -1690,7 +1736,29 @@ class PstExportService:
                         except Exception:
                             current_item = None
 
+                        already_in_target_folder = False
                         if current_item is not None:
+                            try:
+                                already_in_target_folder = (
+                                    str(getattr(current_item.Parent, "EntryID", "") or "")
+                                    == str(getattr(target_folder, "EntryID", "") or "")
+                                )
+                            except Exception:
+                                already_in_target_folder = False
+
+                        if already_in_target_folder:
+                            # O item já está na pasta correta; a verificação por
+                            # source_key só não confirmou a tempo (Outlook lento).
+                            # Mover um item para a pasta onde ele já está pode
+                            # falhar no COM do Outlook e levar à exclusão indevida
+                            # de um item que foi salvo corretamente — não faz
+                            # sentido tentar.
+                            self.log_stage(
+                                "verification",
+                                "Item já está na pasta correta; ignorando relocação",
+                                eml=str(eml_file)
+                            )
+                        elif current_item is not None:
                             try:
                                 moved = current_item.Move(target_folder)
                                 moved.Save()
@@ -1766,6 +1834,12 @@ class PstExportService:
                     ensure_ascii=False
                 )
             )
+            # O PST atingiu o tamanho máximo também pode acontecer aqui, no
+            # item.Save() principal, não só no Move() de relocação — precisa
+            # interromper a conversão imediatamente em vez de tentar salvar
+            # (e falhar) todos os itens restantes um a um.
+            if self.is_pst_capacity_error(error):
+                raise PstCapacityError(str(error)) from error
             return {"success": False, "error": str(error)}
 
     def detach_pst(self, namespace, pst_root):
@@ -1781,6 +1855,23 @@ class PstExportService:
                 "success": False,
                 "error": str(error)
             }
+
+    def detach_store_by_path_if_attached(self, namespace, pst_path):
+        """Detach an existing PST from the Outlook profile before it is deleted.
+
+        Needed before --existing-action replace removes the file: deleting a
+        .pst that is still attached to the profile fails with a Windows
+        sharing-violation PermissionError.
+        """
+        pst_path = Path(pst_path).resolve()
+        for store in namespace.Stores:
+            try:
+                store_path = getattr(store, "FilePath", None)
+                if store_path and Path(store_path).resolve() == pst_path:
+                    return self.detach_pst(namespace, store.GetRootFolder())
+            except Exception as error:
+                return {"success": False, "error": str(error)}
+        return {"success": True, "error": None}
 
     def write_report(self, result):
         pst_path = self.normalize_path(result["pst_path"])
@@ -1971,6 +2062,7 @@ class PstExportService:
         checkpoint_path = None
         sqlite_path = None
         total_emls = 0
+        destination_lock_path = None
         self._folder_cache.clear()
         self._pending_verifications.clear()
         self._verification_metrics.update({
@@ -2038,20 +2130,66 @@ class PstExportService:
                             pst_path = candidate
                             result["pst_path"] = str(candidate)
                             break
-                elif existing_action == "replace":
-                    for sidecar in (
-                        pst_path, pst_path.with_suffix(".pst_checkpoint.sqlite3"),
-                        pst_path.with_suffix(".pst_checkpoint.json"),
-                        pst_path.with_suffix(".pst_report.json"),
-                        pst_path.with_suffix(".pst_report.csv"),
-                        pst_path.with_suffix(".pst_failed_imports.csv")
-                    ):
-                        sidecar.unlink(missing_ok=True)
+            # Impede que duas conversões apontando para o mesmo PST corrompam
+            # o mesmo perfil do Outlook simultaneamente (o COM não é seguro
+            # para reentrância concorrente sobre o mesmo Outlook.Application).
+            destination_lock_path = self.acquire_destination_lock(pst_path)
             self.log_stage("precheck", "Inicializando automação COM do Outlook Classic")
             pythoncom.CoInitialize()
 
-            outlook = win32com.client.Dispatch("Outlook.Application")
-            namespace = outlook.GetNamespace("MAPI")
+            try:
+                outlook = win32com.client.Dispatch("Outlook.Application")
+                namespace = outlook.GetNamespace("MAPI")
+            except Exception as error:
+                raise RuntimeError(
+                    "Não foi possível iniciar a automação COM do Outlook Classic "
+                    f"({error}). Verifique se o Outlook Classic (não o novo Outlook "
+                    "para Windows, que não suporta automação COM) está instalado, "
+                    "com um perfil de e-mail já configurado, e se a arquitetura do "
+                    "Python (32/64 bits) é a mesma do Outlook instalado."
+                ) from error
+
+            if existing_action == "replace" and pst_path.exists():
+                # É preciso desanexar o PST do perfil antes de apagar o arquivo:
+                # excluir um .pst ainda aberto no Outlook falha com um
+                # PermissionError de violação de compartilhamento do Windows.
+                detach_result = self.detach_store_by_path_if_attached(namespace, pst_path)
+                if not detach_result["success"]:
+                    self.log_info(
+                        f"Não foi possível desanexar o PST existente do perfil: "
+                        f"{detach_result['error']}"
+                    )
+                sidecars = (
+                    pst_path, pst_path.with_suffix(".pst_checkpoint.sqlite3"),
+                    pst_path.with_suffix(".pst_checkpoint.json"),
+                    pst_path.with_suffix(".pst_report.json"),
+                    pst_path.with_suffix(".pst_report.csv"),
+                    pst_path.with_suffix(".pst_failed_imports.csv")
+                )
+                delete_error = None
+                # Mesmo já desanexado, o Outlook (ou indexação/antivírus)
+                # costuma manter o arquivo brevemente ocupado logo após o
+                # RemoveStore; poucas novas tentativas com espera curta
+                # absorvem essa janela sem precisar de intervenção manual.
+                for attempt in range(6):
+                    delete_error = None
+                    for sidecar in sidecars:
+                        try:
+                            sidecar.unlink(missing_ok=True)
+                        except OSError as error:
+                            delete_error = error
+                    if delete_error is None:
+                        break
+                    time.sleep(min(0.5 * (attempt + 1), 3.0))
+                if delete_error is not None:
+                    raise RuntimeError(
+                        f"Não foi possível substituir o PST existente em '{pst_path}' "
+                        f"porque o arquivo ainda está em uso, provavelmente aberto no "
+                        f"Outlook: {delete_error}. Feche o Outlook Classic e tente de "
+                        "novo, ou use --existing-action resume/number."
+                    ) from delete_error
+
+            self.ensure_disk_capacity(pst_path)
 
             self.log_stage("outlook", "Abrindo ou anexando o arquivo PST ao perfil")
             outlook_attach_started = time.perf_counter()
@@ -2164,6 +2302,12 @@ class PstExportService:
                     result["eml_imported"] += 1
                     continue
 
+                if existing_action == "resume" and not self.retry_failed_on_resume:
+                    previous_status = checkpoint_store.get_item(source_key)
+                    if previous_status and previous_status.get("status") == "failed":
+                        result["eml_failed"] += 1
+                        continue
+
                 folder_parts = self.get_pst_folder_parts(
                     mail_folders_root=mail_folders_root,
                     eml_file=eml_file
@@ -2184,6 +2328,9 @@ class PstExportService:
                 }
 
                 try:
+                    if index == 1 or index % self.checkpoint_batch_size == 0:
+                        self.ensure_disk_capacity(pst_path)
+
                     target_folder = self.get_or_create_outlook_folder(
                         root_folder=pst_root,
                         folder_parts=folder_parts
@@ -2485,6 +2632,8 @@ class PstExportService:
             if temp_dir:
                 temp_dir.cleanup()
 
+            self.release_destination_lock(destination_lock_path)
+
             if checkpoint_store is not None:
                 try:
                     checkpoint_store.close()
@@ -2500,49 +2649,49 @@ class PstExportService:
 
 
 def print_pst_result(result):
-    print("")
-    print("=" * 70)
-    print("FASE 8C — CONVERSÃO EML PARA PST")
-    print("=" * 70)
-    print(f"Engine: {result.get('engine')}")
-    print(f"Backup origem: {result.get('backup_root')}")
-    print(f"PST destino: {result.get('pst_path')}")
-    print(f"Nome PST: {result.get('pst_display_name')}")
-    print(f"EML encontrados: {result.get('eml_found')}")
-    print(f"EML importados: {result.get('eml_imported')}")
-    print(f"EML com falha: {result.get('eml_failed')}")
-    print(f"Duração: {result.get('duration_seconds')} segundos")
+    _report("")
+    _report("=" * 70)
+    _report("FASE 8C — CONVERSÃO EML PARA PST")
+    _report("=" * 70)
+    _report(f"Engine: {result.get('engine')}")
+    _report(f"Backup origem: {result.get('backup_root')}")
+    _report(f"PST destino: {result.get('pst_path')}")
+    _report(f"Nome PST: {result.get('pst_display_name')}")
+    _report(f"EML encontrados: {result.get('eml_found')}")
+    _report(f"EML importados: {result.get('eml_imported')}")
+    _report(f"EML com falha: {result.get('eml_failed')}")
+    _report(f"Duração: {result.get('duration_seconds')} segundos")
 
     if result.get("report_path"):
-        print(f"Relatório JSON: {result.get('report_path')}")
+        _report(f"Relatório JSON: {result.get('report_path')}")
 
     if result.get("csv_report_path"):
-        print(f"Relatório CSV: {result.get('csv_report_path')}")
+        _report(f"Relatório CSV: {result.get('csv_report_path')}")
 
     if result.get("failed_csv_report_path"):
-        print(f"Falhas CSV: {result.get('failed_csv_report_path')}")
+        _report(f"Falhas CSV: {result.get('failed_csv_report_path')}")
 
     if result.get("success"):
-        print("")
-        print("[SUCESSO] PST gerado com sucesso.")
+        _report("")
+        _report("[SUCESSO] PST gerado com sucesso.")
     elif result.get("partial_success"):
-        print("")
-        print("[ATENÇÃO] PST gerado parcialmente.")
-        print("Alguns EML falharam, mas a conversão continuou.")
-        print("Revise o CSV de falhas.")
+        _report("")
+        _report("[ATENÇÃO] PST gerado parcialmente.")
+        _report("Alguns EML falharam, mas a conversão continuou.")
+        _report("Revise o CSV de falhas.")
     else:
-        print("")
-        print("[FALHA] A geração do PST não conseguiu importar nenhum EML ou terminou com erro crítico.")
+        _report("")
+        _report("[FALHA] A geração do PST não conseguiu importar nenhum EML ou terminou com erro crítico.")
 
     if result.get("errors"):
-        print("")
-        print("ERROS/AVISOS")
-        print("-" * 70)
+        _report("")
+        _report("ERROS/AVISOS")
+        _report("-" * 70)
 
         for error in result.get("errors", []):
-            print(f"- {error}")
+            _report(f"- {error}")
 
-    print("=" * 70)
+    _report("=" * 70)
 
 
 def main():
@@ -2595,7 +2744,11 @@ def main():
     args = parser.parse_args()
 
     os.environ["M365_EML_IMPORT_RATE_PER_SECOND"] = str(args.import_rate)
-    service = PstExportService()
+    # Sem um logger real (console + arquivo), log_info/log_error só escreviam
+    # em logs/pst/<id>.log; era um _report() bruto que fazia o [PST-PROGRESS]
+    # chegar ao stdout monitorado pelo coordenador. Usar o mesmo logger da
+    # fase de backup elimina o _report() e mantém esse contrato.
+    service = PstExportService(logger=setup_logger())
 
     result = service.export_backup_to_pst(
         backup_root=args.backup_root,

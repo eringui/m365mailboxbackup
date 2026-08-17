@@ -15,7 +15,7 @@ from datetime import datetime
 from email.parser import BytesHeaderParser
 from pathlib import Path
 
-APP_VERSION = "5.0.0"
+APP_VERSION = "5.1.3"
 SCHEMA_VERSION = 2
 DEFAULT_SETTINGS = {
     "appearance": {"theme": "automatic", "font_size": 10, "compact_tables": False},
@@ -138,6 +138,7 @@ class AppSettings:
         """Build the exact environment consumed by backend child processes."""
         return {
             "M365_BACKUP_OUTPUT_ROOT": str(self.resolved_path("backup_root")),
+            "M365_LOGS_ROOT": str(self.resolved_path("logs_root")),
             "M365_EML_DOWNLOAD_WORKERS": str(self.get("backup", "download_workers", 24)),
             "M365_EML_DOWNLOAD_CHUNK_SIZE_MB": str(self.get("backup", "chunk_size_mb", 1)),
             "M365_EML_MAX_PENDING_DOWNLOADS": str(self.get("backup", "max_pending_downloads", 96)),

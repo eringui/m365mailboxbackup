@@ -6,7 +6,14 @@ import sys
 from src.config.settings import validate_settings
 from src.services.graph_service import GraphService
 from src.services.mailbox_backup_service import MailboxBackupService
-from src.utils.logger import setup_logger
+from src.services.operation_control import OperationInterrupted
+from src.utils.logger import setup_logger, setup_report_logger
+
+_report_logger = setup_report_logger()
+
+
+def _report(message=""):
+    _report_logger.info(message)
 
 
 def call_method_compatible(method, **kwargs):
@@ -30,37 +37,20 @@ def build_excluded_folder_names(args):
 
     if args.profile_only:
         excluded_folder_names.extend(
-            [
-                "Arquivo Morto",
-                "Archive",
-                "Online Archive",
-                "In-Place Archive",
-                "Recoverable Items",
-                "Deletions",
-                "Purges",
-                "Versions",
-                "Audits",
-                "DiscoveryHolds",
-                "Sync Issues",
-                "Problemas de Sincronização",
-                "Conversation History",
-                "Histórico de Conversas",
-                "RSS Feeds",
-                "Feeds RSS"
-            ]
+            MailboxBackupService.DEFAULT_EXCLUDED_PROFILE_FOLDER_NAMES
         )
 
     return excluded_folder_names
 
 
 def print_phase_0_result(result):
-    print("")
-    print("=" * 70)
-    print("FASE 0 — VALIDAÇÃO DO AMBIENTE")
-    print("=" * 70)
+    _report("")
+    _report("=" * 70)
+    _report("FASE 0 — VALIDAÇÃO DO AMBIENTE")
+    _report("=" * 70)
 
-    print(f"Mailbox testada: {result.get('mailbox')}")
-    print("")
+    _report(f"Mailbox testada: {result.get('mailbox')}")
+    _report("")
 
     items = {
         "Autenticação Graph": result.get("auth", False),
@@ -75,44 +65,44 @@ def print_phase_0_result(result):
 
     for item, status in items.items():
         if status:
-            print(f"[OK] {item}")
+            _report(f"[OK] {item}")
         else:
-            print(f"[FALHA] {item}")
+            _report(f"[FALHA] {item}")
 
-    print("")
+    _report("")
 
     if result.get("errors"):
-        print("ERROS ENCONTRADOS:")
-        print("-" * 70)
+        _report("ERROS ENCONTRADOS:")
+        _report("-" * 70)
 
         for error in result.get("errors", []):
-            print(error)
+            _report(error)
 
-        print("")
+        _report("")
 
     if all(items.values()):
-        print("[SUCESSO] Fase 0 validada com sucesso.")
-        print("Você pode prosseguir para a Fase 1 quando quiser.")
+        _report("[SUCESSO] Fase 0 validada com sucesso.")
+        _report("Você pode prosseguir para a Fase 1 quando quiser.")
     else:
-        print("[ATENÇÃO] Fase 0 ainda não foi validada completamente.")
-        print("Corrija os erros acima antes de seguir para a Fase 1.")
+        _report("[ATENÇÃO] Fase 0 ainda não foi validada completamente.")
+        _report("Corrija os erros acima antes de seguir para a Fase 1.")
 
-    print("=" * 70)
+    _report("=" * 70)
 
 
 def print_phase_1_result(result):
-    print("")
-    print("=" * 70)
-    print("FASE 1 — GRAPHSERVICE")
-    print("=" * 70)
+    _report("")
+    _report("=" * 70)
+    _report("FASE 1 — GRAPHSERVICE")
+    _report("=" * 70)
 
     if not result.get("success"):
-        print("[FALHA] Inspeção da mailbox não concluída.")
+        _report("[FALHA] Inspeção da mailbox não concluída.")
 
         for error in result.get("errors", []):
-            print(error)
+            _report(error)
 
-        print("=" * 70)
+        _report("=" * 70)
         return
 
     mailbox = result.get("mailbox", {})
@@ -120,249 +110,249 @@ def print_phase_1_result(result):
     inbox = result.get("inbox", {})
     messages = result.get("messages_preview", [])
 
-    print("[OK] GraphService inicializado")
-    print("[OK] Autenticação Graph funcionando")
-    print("[OK] Consulta de usuário funcionando")
-    print("[OK] Consulta de pastas com paginação funcionando")
-    print("[OK] Localização da Inbox funcionando")
-    print("[OK] Listagem de mensagens funcionando")
-    print("")
+    _report("[OK] GraphService inicializado")
+    _report("[OK] Autenticação Graph funcionando")
+    _report("[OK] Consulta de usuário funcionando")
+    _report("[OK] Consulta de pastas com paginação funcionando")
+    _report("[OK] Localização da Inbox funcionando")
+    _report("[OK] Listagem de mensagens funcionando")
+    _report("")
 
-    print("MAILBOX")
-    print("-" * 70)
-    print(f"Nome: {mailbox.get('displayName')}")
-    print(f"Email: {mailbox.get('mail')}")
-    print(f"UPN: {mailbox.get('userPrincipalName')}")
-    print(f"Conta habilitada: {mailbox.get('accountEnabled')}")
-    print("")
+    _report("MAILBOX")
+    _report("-" * 70)
+    _report(f"Nome: {mailbox.get('displayName')}")
+    _report(f"Email: {mailbox.get('mail')}")
+    _report(f"UPN: {mailbox.get('userPrincipalName')}")
+    _report(f"Conta habilitada: {mailbox.get('accountEnabled')}")
+    _report("")
 
-    print("INBOX")
-    print("-" * 70)
-    print(f"Nome: {inbox.get('displayName')}")
-    print(f"ID: {inbox.get('id')}")
-    print(f"Total de itens: {inbox.get('totalItemCount')}")
-    print(f"Itens não lidos: {inbox.get('unreadItemCount')}")
-    print("")
+    _report("INBOX")
+    _report("-" * 70)
+    _report(f"Nome: {inbox.get('displayName')}")
+    _report(f"ID: {inbox.get('id')}")
+    _report(f"Total de itens: {inbox.get('totalItemCount')}")
+    _report(f"Itens não lidos: {inbox.get('unreadItemCount')}")
+    _report("")
 
-    print("PASTAS ENCONTRADAS")
-    print("-" * 70)
+    _report("PASTAS ENCONTRADAS")
+    _report("-" * 70)
 
     for folder in folders:
-        print(
+        _report(
             f"- {folder.get('displayName')} | "
             f"Total: {folder.get('totalItemCount')} | "
             f"Não lidos: {folder.get('unreadItemCount')}"
         )
 
-    print("")
-    print("PRÉVIA DE EMAILS")
-    print("-" * 70)
+    _report("")
+    _report("PRÉVIA DE EMAILS")
+    _report("-" * 70)
 
     if not messages:
-        print("Nenhuma mensagem retornada.")
+        _report("Nenhuma mensagem retornada.")
     else:
         for message in messages:
-            print("")
-            print(f"Assunto: {message.get('subject')}")
-            print(f"Remetente: {message.get('from')}")
-            print(f"Recebido: {message.get('receivedDateTime')}")
-            print(f"Tem anexos: {message.get('hasAttachments')}")
+            _report("")
+            _report(f"Assunto: {message.get('subject')}")
+            _report(f"Remetente: {message.get('from')}")
+            _report(f"Recebido: {message.get('receivedDateTime')}")
+            _report(f"Tem anexos: {message.get('hasAttachments')}")
 
-    print("")
-    print("[SUCESSO] Fase 1 concluída com sucesso.")
-    print("GraphService está pronto para ser usado nas próximas fases.")
-    print("=" * 70)
+    _report("")
+    _report("[SUCESSO] Fase 1 concluída com sucesso.")
+    _report("GraphService está pronto para ser usado nas próximas fases.")
+    _report("=" * 70)
 
 
 def print_phase_2_result(result):
-    print("")
-    print("=" * 70)
-    print("FASE 2 — EXPORTAÇÃO LOCAL INICIAL")
-    print("=" * 70)
+    _report("")
+    _report("=" * 70)
+    _report("FASE 2 — EXPORTAÇÃO LOCAL INICIAL")
+    _report("=" * 70)
 
-    print(f"Mailbox: {result.get('mailbox')}")
-    print(f"Pasta do backup: {result.get('backup_path')}")
-    print("")
+    _report(f"Mailbox: {result.get('mailbox')}")
+    _report(f"Pasta do backup: {result.get('backup_path')}")
+    _report("")
 
-    print("RESUMO")
-    print("-" * 70)
-    print(f"Pastas exportadas/indexadas: {result.get('folders_count', 0)}")
-    print(f"Mensagens indexadas: {result.get('messages_indexed', 0)}")
-    print(f"Mensagens .eml exportadas: {result.get('messages_exported', 0)}")
-    print(f"Eventos de calendário: {result.get('calendar_events', 0)}")
-    print(f"Contatos: {result.get('contacts', 0)}")
-    print(f"Listas de tarefas: {result.get('task_lists', 0)}")
-    print(f"Tarefas: {result.get('task_items', 0)}")
-    print("")
+    _report("RESUMO")
+    _report("-" * 70)
+    _report(f"Pastas exportadas/indexadas: {result.get('folders_count', 0)}")
+    _report(f"Mensagens indexadas: {result.get('messages_indexed', 0)}")
+    _report(f"Mensagens .eml exportadas: {result.get('messages_exported', 0)}")
+    _report(f"Eventos de calendário: {result.get('calendar_events', 0)}")
+    _report(f"Contatos: {result.get('contacts', 0)}")
+    _report(f"Listas de tarefas: {result.get('task_lists', 0)}")
+    _report(f"Tarefas: {result.get('task_items', 0)}")
+    _report("")
 
     if result.get("errors"):
-        print("ERROS/AVISOS")
-        print("-" * 70)
+        _report("ERROS/AVISOS")
+        _report("-" * 70)
 
         for error in result.get("errors", []):
-            print(error)
+            _report(error)
 
-        print("")
+        _report("")
 
     if result.get("success"):
-        print("[SUCESSO] Fase 2 concluída com sucesso.")
-        print("Backup local inicial gerado.")
+        _report("[SUCESSO] Fase 2 concluída com sucesso.")
+        _report("Backup local inicial gerado.")
     else:
-        print("[ATENÇÃO] Fase 2 finalizada com erros.")
-        print("Revise o manifest.json e os logs.")
+        _report("[ATENÇÃO] Fase 2 finalizada com erros.")
+        _report("Revise o manifest.json e os logs.")
 
-    print("=" * 70)
+    _report("=" * 70)
 
 
 def print_phase_3_result(result):
-    print("")
-    print("=" * 70)
-    print("FASE 3 — EXPORTAÇÃO POR ESTRUTURA DE PASTAS")
-    print("=" * 70)
+    _report("")
+    _report("=" * 70)
+    _report("FASE 3 — EXPORTAÇÃO POR ESTRUTURA DE PASTAS")
+    _report("=" * 70)
 
-    print(f"Mailbox: {result.get('mailbox')}")
-    print(f"Pasta do backup: {result.get('backup_path')}")
-    print("")
+    _report(f"Mailbox: {result.get('mailbox')}")
+    _report(f"Pasta do backup: {result.get('backup_path')}")
+    _report("")
 
-    print("RESUMO")
-    print("-" * 70)
-    print(f"Pastas encontradas: {result.get('folders_count', 0)}")
-    print(f"Pastas processadas: {result.get('folders_processed', 0)}")
-    print(f"Mensagens indexadas: {result.get('messages_indexed', 0)}")
-    print(f"Mensagens .eml exportadas: {result.get('messages_exported', 0)}")
-    print(f"Eventos de calendário: {result.get('calendar_events', 0)}")
-    print(f"Contatos: {result.get('contacts', 0)}")
-    print(f"Listas de tarefas: {result.get('task_lists', 0)}")
-    print(f"Tarefas: {result.get('task_items', 0)}")
-    print("")
+    _report("RESUMO")
+    _report("-" * 70)
+    _report(f"Pastas encontradas: {result.get('folders_count', 0)}")
+    _report(f"Pastas processadas: {result.get('folders_processed', 0)}")
+    _report(f"Mensagens indexadas: {result.get('messages_indexed', 0)}")
+    _report(f"Mensagens .eml exportadas: {result.get('messages_exported', 0)}")
+    _report(f"Eventos de calendário: {result.get('calendar_events', 0)}")
+    _report(f"Contatos: {result.get('contacts', 0)}")
+    _report(f"Listas de tarefas: {result.get('task_lists', 0)}")
+    _report(f"Tarefas: {result.get('task_items', 0)}")
+    _report("")
 
     if result.get("errors"):
-        print("ERROS/AVISOS")
-        print("-" * 70)
+        _report("ERROS/AVISOS")
+        _report("-" * 70)
 
         for error in result.get("errors", []):
-            print(error)
+            _report(error)
 
-        print("")
+        _report("")
 
     if result.get("success"):
-        print("[SUCESSO] Fase 3 concluída com sucesso.")
-        print("Backup por estrutura de pastas gerado.")
+        _report("[SUCESSO] Fase 3 concluída com sucesso.")
+        _report("Backup por estrutura de pastas gerado.")
     else:
-        print("[ATENÇÃO] Fase 3 finalizada com erros.")
-        print("Revise o manifest.json e os logs.")
+        _report("[ATENÇÃO] Fase 3 finalizada com erros.")
+        _report("Revise o manifest.json e os logs.")
 
-    print("=" * 70)
+    _report("=" * 70)
 
 
 def print_phase_4_result(result):
-    print("")
-    print("=" * 70)
-    print("FASE 4 — EXPORTAÇÃO COM CHECKPOINT")
-    print("=" * 70)
+    _report("")
+    _report("=" * 70)
+    _report("FASE 4 — EXPORTAÇÃO COM CHECKPOINT")
+    _report("=" * 70)
 
-    print(f"Mailbox: {result.get('mailbox')}")
-    print(f"Pasta do backup: {result.get('backup_path')}")
-    print("")
+    _report(f"Mailbox: {result.get('mailbox')}")
+    _report(f"Pasta do backup: {result.get('backup_path')}")
+    _report("")
 
-    print("RESUMO")
-    print("-" * 70)
-    print(f"Duração: {result.get('duration_seconds', 0)} segundos")
-    print(f"Pastas encontradas: {result.get('folders_count', 0)}")
-    print(f"Pastas processadas: {result.get('folders_processed', 0)}")
-    print(f"Pastas ignoradas/puladas: {result.get('folders_skipped', 0)}")
-    print(f"Mensagens indexadas: {result.get('messages_indexed', 0)}")
-    print(f"Mensagens .eml exportadas: {result.get('messages_exported', 0)}")
-    print(f"Mensagens ignoradas pelo checkpoint: {result.get('messages_skipped', 0)}")
-    print(f"Mensagens com falha: {result.get('messages_failed', 0)}")
-    print(f"Anexos exportados separadamente: {result.get('attachments_exported', 0)}")
-    print(f"Eventos de calendário: {result.get('calendar_events', 0)}")
-    print(f"Contatos: {result.get('contacts', 0)}")
-    print(f"Listas de tarefas: {result.get('task_lists', 0)}")
-    print(f"Tarefas: {result.get('task_items', 0)}")
-    print("")
+    _report("RESUMO")
+    _report("-" * 70)
+    _report(f"Duração: {result.get('duration_seconds', 0)} segundos")
+    _report(f"Pastas encontradas: {result.get('folders_count', 0)}")
+    _report(f"Pastas processadas: {result.get('folders_processed', 0)}")
+    _report(f"Pastas ignoradas/puladas: {result.get('folders_skipped', 0)}")
+    _report(f"Mensagens indexadas: {result.get('messages_indexed', 0)}")
+    _report(f"Mensagens .eml exportadas: {result.get('messages_exported', 0)}")
+    _report(f"Mensagens ignoradas pelo checkpoint: {result.get('messages_skipped', 0)}")
+    _report(f"Mensagens com falha: {result.get('messages_failed', 0)}")
+    _report(f"Anexos exportados separadamente: {result.get('attachments_exported', 0)}")
+    _report(f"Eventos de calendário: {result.get('calendar_events', 0)}")
+    _report(f"Contatos: {result.get('contacts', 0)}")
+    _report(f"Listas de tarefas: {result.get('task_lists', 0)}")
+    _report(f"Tarefas: {result.get('task_items', 0)}")
+    _report("")
 
     if result.get("errors"):
-        print("ERROS/AVISOS")
-        print("-" * 70)
+        _report("ERROS/AVISOS")
+        _report("-" * 70)
 
         for error in result.get("errors", []):
-            print(error)
+            _report(error)
 
-        print("")
+        _report("")
 
     if result.get("success"):
-        print("[SUCESSO] Fase 4 concluída com sucesso.")
-        print("Backup com checkpoint gerado.")
+        _report("[SUCESSO] Fase 4 concluída com sucesso.")
+        _report("Backup com checkpoint gerado.")
     else:
-        print("[ATENÇÃO] Fase 4 finalizada com erros.")
-        print("Revise manifest.json, checkpoint.json e logs.")
+        _report("[ATENÇÃO] Fase 4 finalizada com erros.")
+        _report("Revise manifest.json, checkpoint.json e logs.")
 
-    print("=" * 70)
+    _report("=" * 70)
 
 
 def print_phase_5_result(result):
-    print("")
-    print("=" * 70)
-    print("FASE 5 — BACKUP EM LOTE VIA CSV")
-    print("=" * 70)
+    _report("")
+    _report("=" * 70)
+    _report("FASE 5 — BACKUP EM LOTE VIA CSV")
+    _report("=" * 70)
 
-    print(f"Arquivo CSV: {result.get('batch_file')}")
-    print(f"Total de mailboxes: {result.get('total_mailboxes', 0)}")
-    print(f"Processadas: {result.get('processed', 0)}")
-    print(f"Sucesso: {result.get('success_count', 0)}")
-    print(f"Falha: {result.get('failed_count', 0)}")
-    print(f"Duração total: {result.get('duration_seconds', 0)} segundos")
-    print("")
+    _report(f"Arquivo CSV: {result.get('batch_file')}")
+    _report(f"Total de mailboxes: {result.get('total_mailboxes', 0)}")
+    _report(f"Processadas: {result.get('processed', 0)}")
+    _report(f"Sucesso: {result.get('success_count', 0)}")
+    _report(f"Falha: {result.get('failed_count', 0)}")
+    _report(f"Duração total: {result.get('duration_seconds', 0)} segundos")
+    _report("")
 
-    print("PRÉ-VALIDAÇÃO")
-    print("-" * 70)
-    print(f"Mailboxes válidas: {result.get('precheck_valid_count', 0)}")
-    print(f"Mailboxes inválidas: {result.get('precheck_invalid_count', 0)}")
+    _report("PRÉ-VALIDAÇÃO")
+    _report("-" * 70)
+    _report(f"Mailboxes válidas: {result.get('precheck_valid_count', 0)}")
+    _report(f"Mailboxes inválidas: {result.get('precheck_invalid_count', 0)}")
 
     if result.get("precheck_report_path"):
-        print(f"Precheck JSON: {result.get('precheck_report_path')}")
+        _report(f"Precheck JSON: {result.get('precheck_report_path')}")
 
     if result.get("precheck_csv_report_path"):
-        print(f"Precheck CSV: {result.get('precheck_csv_report_path')}")
+        _report(f"Precheck CSV: {result.get('precheck_csv_report_path')}")
 
     if result.get("report_path"):
-        print(f"Relatório JSON: {result.get('report_path')}")
+        _report(f"Relatório JSON: {result.get('report_path')}")
 
     if result.get("csv_report_path"):
-        print(f"Relatório CSV: {result.get('csv_report_path')}")
+        _report(f"Relatório CSV: {result.get('csv_report_path')}")
 
-    print("")
-    print("RESULTADOS POR MAILBOX")
-    print("-" * 70)
+    _report("")
+    _report("RESULTADOS POR MAILBOX")
+    _report("-" * 70)
 
     for item in result.get("results", []):
         status = "OK" if item.get("success") else "FALHA"
 
-        print("")
-        print(f"[{status}] {item.get('mailbox')}")
-        print(f"Backup: {item.get('backup_path')}")
-        print(f"Pastas: {item.get('folders_processed', 0)}")
-        print(f"Mensagens exportadas: {item.get('messages_exported', 0)}")
-        print(f"Mensagens com falha: {item.get('messages_failed', 0)}")
-        print(f"Anexos exportados: {item.get('attachments_exported', 0)}")
+        _report("")
+        _report(f"[{status}] {item.get('mailbox')}")
+        _report(f"Backup: {item.get('backup_path')}")
+        _report(f"Pastas: {item.get('folders_processed', 0)}")
+        _report(f"Mensagens exportadas: {item.get('messages_exported', 0)}")
+        _report(f"Mensagens com falha: {item.get('messages_failed', 0)}")
+        _report(f"Anexos exportados: {item.get('attachments_exported', 0)}")
 
         if item.get("errors"):
-            print("Erros:")
+            _report("Erros:")
 
             for error in item.get("errors", []):
-                print(f"- {error}")
+                _report(f"- {error}")
 
-    print("")
+    _report("")
 
     if result.get("success"):
-        print("[SUCESSO] Fase 5 concluída com sucesso.")
-        print("Backup em lote finalizado sem falhas.")
+        _report("[SUCESSO] Fase 5 concluída com sucesso.")
+        _report("Backup em lote finalizado sem falhas.")
     else:
-        print("[ATENÇÃO] Fase 5 finalizada com uma ou mais falhas.")
-        print("Revise o relatório batch_report e os logs.")
+        _report("[ATENÇÃO] Fase 5 finalizada com uma ou mais falhas.")
+        _report("Revise o relatório batch_report e os logs.")
 
-    print("=" * 70)
+    _report("=" * 70)
 
 
 def main():
@@ -379,11 +369,15 @@ def main():
 
     parser.add_argument(
         "--phase",
-        required=True,
+        required=False,
         choices=["0", "1", "2", "3", "4", "5"],
         help="Fase do projeto a executar. Use: --phase 0, --phase 1, --phase 2, --phase 3, --phase 4 ou --phase 5."
     )
 
+    parser.add_argument(
+        "--repair-failures", dest="repair_failures", action="store_true",
+        help="Tenta novamente somente os EML ainda registrados como falha."
+    )
     parser.add_argument(
         "--mailbox",
         required=False,
@@ -470,24 +464,24 @@ def main():
     )
 
     args = parser.parse_args()
+    logger = setup_logger()
+
     job_options = {}
     if args.job_options_file:
         try:
             with open(args.job_options_file, "r", encoding="utf-8") as file:
                 job_options = json.load(file)
         except Exception as error:
-            print(f"[ERRO] Não foi possível carregar as opções do trabalho: {error}")
+            logger.error(f"Não foi possível carregar as opções do trabalho: {error}")
             sys.exit(1)
 
-    if args.phase in ["0", "1", "2", "3", "4"] and not args.mailbox:
-        print("[ERRO] O argumento --mailbox é obrigatório para as fases 0, 1, 2, 3 e 4.")
+    if not args.repair_failures and args.phase in ["0", "1", "2", "3", "4"] and not args.mailbox:
+        logger.error("O argumento --mailbox é obrigatório para as fases 0, 1, 2, 3 e 4.")
         sys.exit(1)
 
-    if args.phase == "5" and not args.batch:
-        print("[ERRO] O argumento --batch é obrigatório para a fase 5.")
+    if not args.repair_failures and args.phase == "5" and not args.batch:
+        logger.error("O argumento --batch é obrigatório para a fase 5.")
         sys.exit(1)
-
-    logger = setup_logger()
 
     logger.info("Iniciando M365 Mailbox Backup")
     logger.info(f"Fase informada: {args.phase}")
@@ -510,8 +504,7 @@ def main():
     try:
         validate_settings()
     except Exception as error:
-        logger.error(error)
-        print(f"[ERRO] Configuração inválida: {error}")
+        logger.error(f"Configuração inválida: {error}")
         sys.exit(1)
 
     graph_service = GraphService(logger)

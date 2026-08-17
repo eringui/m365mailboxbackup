@@ -9,6 +9,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
+from email.parser import BytesHeaderParser
 from pathlib import Path
 
 from src.config.settings import (
@@ -21,8 +22,10 @@ from src.config.settings import (
 
 try:
     from src.services.checkpoint_store import CheckpointStore
+    from src.services.operation_control import OperationControl, OperationInterrupted
 except ImportError:
     from checkpoint_store import CheckpointStore
+    from operation_control import OperationControl, OperationInterrupted
 
 
 class MailboxBackupService:
@@ -58,6 +61,7 @@ class MailboxBackupService:
         self._last_progress_log_at = 0.0
         self._last_progress_log_current = -1
         self._last_checkpoint_json_at = 0.0
+        self.operation_control = OperationControl()
 
     def sanitize_name(self, value, max_length=80):
         if not value:
@@ -89,6 +93,12 @@ class MailboxBackupService:
             return False
 
         normalized = str(folder_path).strip().lower()
+        # Compara por segmento de caminho (separado por "/"), não por substring
+        # crua: nomes genéricos como "Versions"/"Audits" não devem casar com
+        # pastas reais que apenas contêm esse texto (ex.: "Auditssociados").
+        segments = {
+            segment.strip() for segment in normalized.split("/") if segment.strip()
+        }
 
         excluded = set()
 
@@ -97,11 +107,7 @@ class MailboxBackupService:
                 if item:
                     excluded.add(str(item).strip().lower())
 
-        for folder_name in excluded:
-            if folder_name and folder_name in normalized:
-                return True
-
-        return False
+        return bool(excluded & segments)
 
     def create_backup_structure(self, mailbox_email):
         """Use a single stable backup root for each mailbox."""
@@ -490,6 +496,7 @@ class MailboxBackupService:
             "folders_count": 0,
             "messages_indexed": 0,
             "messages_exported": 0,
+            "messages_failed": 0,
             "calendar_events": 0,
             "contacts": 0,
             "task_lists": 0,
@@ -567,6 +574,7 @@ class MailboxBackupService:
                         f"Erro ao baixar mensagem {message_id}: "
                         f"{mime_result['error']}"
                     )
+                    result["messages_failed"] += 1
 
                     continue
 
@@ -665,7 +673,12 @@ class MailboxBackupService:
                 break
 
         while futures:
-            completed, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            self.operation_control.checkpoint()
+            completed, _ = wait(
+                tuple(futures), timeout=0.25, return_when=FIRST_COMPLETED
+            )
+            if not completed:
+                continue
             for future in completed:
                 item = futures.pop(future)
                 try:
@@ -772,9 +785,7 @@ class MailboxBackupService:
         checkpoint["failed_message_count"] = len(failed_message_ids)
         if expected_message_count is not None:
             requested_expected = int(expected_message_count or 0)
-            checkpoint["progress_consistent"] = (
-                requested_expected > 0 and exported_count <= requested_expected
-            )
+            checkpoint["progress_consistent"] = exported_count <= requested_expected
             checkpoint["expected_message_count"] = max(
                 exported_count,
                 requested_expected
@@ -986,6 +997,10 @@ class MailboxBackupService:
         selected_folder_ids = {
             str(value) for value in (selected_folder_ids or []) if value
         }
+        selected_folder_paths_normalized = {
+            str(value).strip().lower()
+            for value in (selected_folder_paths or []) if value
+        }
         if selected_folder_ids:
             flat_folders = [
                 folder for folder in flat_folders
@@ -993,6 +1008,18 @@ class MailboxBackupService:
             ]
             self.logger.info(
                 f"Escopo personalizado: {len(flat_folders)} pasta(s) selecionada(s)."
+            )
+        elif selected_folder_paths_normalized:
+            # Usado quando um escopo de pastas é aplicado a outras mailboxes de um
+            # lote: os IDs de pasta são específicos de cada mailbox, então o escopo
+            # viaja como caminhos e precisa ser resolvido aqui.
+            flat_folders = [
+                folder for folder in flat_folders
+                if str(folder.get("path") or "").strip().lower()
+                in selected_folder_paths_normalized
+            ]
+            self.logger.info(
+                f"Escopo personalizado (por caminho): {len(flat_folders)} pasta(s) selecionada(s)."
             )
 
         result["folders_count"] = len(flat_folders)
@@ -1051,6 +1078,7 @@ class MailboxBackupService:
         )
 
         for folder in flat_folders:
+            self.operation_control.checkpoint()
             folder_id = folder.get("id")
             folder_path = folder.get("path") or folder.get("displayName")
 
@@ -1068,11 +1096,6 @@ class MailboxBackupService:
                 result["folders_skipped"] += 1
                 continue
 
-            if folder_id in processed_folder_ids and resume_path:
-                self.logger.info(
-                    f"Pasta já conhecida no histórico: {folder_path}. Usando sincronização rápida."
-                )
-
             self.logger.info(
                 f"Exportando pasta: {folder_path}"
             )
@@ -1085,21 +1108,24 @@ class MailboxBackupService:
             eml_folder = local_folder / "eml"
             attachments_folder = local_folder / "attachments"
 
-            local_folder.mkdir(
-                parents=True,
-                exist_ok=True
-            )
-
-            eml_folder.mkdir(
-                parents=True,
-                exist_ok=True
-            )
-
-            if export_attachments:
-                attachments_folder.mkdir(
-                    parents=True,
-                    exist_ok=True
+            try:
+                local_folder.mkdir(parents=True, exist_ok=True)
+                eml_folder.mkdir(parents=True, exist_ok=True)
+                if export_attachments:
+                    attachments_folder.mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                # Nomes de pasta reservados no Windows (CON, PRN, COM1...) ou
+                # caminhos que excedem o MAX_PATH não podem virar diretório;
+                # isola a falha nesta pasta em vez de abortar a mailbox inteira.
+                error_message = (
+                    f"Não foi possível criar a pasta local para '{folder_path}': "
+                    f"{error}"
                 )
+                self.logger.error(error_message)
+                result["errors"].append(error_message)
+                result["folders_skipped"] += 1
+                checkpoint_store.mark_folder_sync_error(folder_id, str(error))
+                continue
 
             max_items = None
 
@@ -1162,6 +1188,7 @@ class MailboxBackupService:
                 top=250,
                 max_items=max_items
             ):
+                self.operation_control.checkpoint()
                 if not page_result["success"]:
                     error_message = (
                         f"Erro ao consultar mensagens da pasta {folder_path}: "
@@ -1354,9 +1381,23 @@ class MailboxBackupService:
                     eml_path = item["eml_path"]
 
                     if not mime_result["success"]:
+                        diagnostic = mime_result.get("diagnostic") or {}
                         error_message = (
                             f"Erro ao baixar mensagem da pasta {folder_path}: "
-                            f"{message_id} | {mime_result.get('error')}"
+                            f"{message_id} | estágio={diagnostic.get('stage', 'desconhecido')} | "
+                            f"tipo={diagnostic.get('exception_type', 'desconhecido')} | "
+                            f"errno={diagnostic.get('errno')} | winerror={diagnostic.get('winerror')} | "
+                            f"temporário={diagnostic.get('temporary_length', '?')} caracteres | "
+                            f"{mime_result.get('error')}"
+                        )
+                        self.logger.error(
+                            "[ROOT-CAUSE] %s",
+                            json.dumps({
+                                "mailbox": mailbox_email, "folder_id": folder_id,
+                                "folder_path": folder_path, "message_id": message_id,
+                                "subject": message.get("subject"),
+                                "download": mime_result,
+                            }, ensure_ascii=False)
                         )
                         result["errors"].append(error_message)
                         checkpoint["errors"].append(error_message)
@@ -1370,6 +1411,7 @@ class MailboxBackupService:
                         result["messages_failed"] += 1
                         checkpoint_changes_pending += 1
                     else:
+                        actual_eml_path = Path(mime_result.get("path") or eml_path)
                         folder_exported_count += 1
                         result["messages_exported"] += 1
                         downloaded_bytes += int(
@@ -1377,7 +1419,7 @@ class MailboxBackupService:
                         )
                         self.logger.info(
                             f"[OK] EML salvo {folder_exported_count}/{max_items or '?'} "
-                            f"na pasta {folder_path}: {eml_path.name} | "
+                            f"na pasta {folder_path}: {actual_eml_path.name} | "
                             f"{mime_result.get('bytes_written', 0)} bytes"
                         )
 
@@ -1396,12 +1438,12 @@ class MailboxBackupService:
                         checkpoint_store.mark_completed(
                             message_id,
                             folder_id=folder_id,
-                            output_path=str(eml_path),
+                            output_path=str(actual_eml_path),
                             bytes_written=int(
                                 mime_result.get("bytes_written", 0) or 0
                             )
                         )
-                        existing_eml_by_suffix[self.message_file_suffix(message_id)] = eml_path
+                        existing_eml_by_suffix[self.message_file_suffix(message_id)] = actual_eml_path
                         checkpoint_changes_pending += 1
 
                     self.update_checkpoint_progress(
@@ -1509,7 +1551,16 @@ class MailboxBackupService:
         )
         self.log_structured_progress(checkpoint)
 
-        checkpoint["errors"] = checkpoint.get("errors", []) + result["errors"]
+        # Deduplica e limita o histórico acumulado entre retomadas para que o
+        # checkpoint.json não cresça sem limite em backups retomados muitas vezes.
+        combined_errors = checkpoint.get("errors", []) + result["errors"]
+        seen_errors = set()
+        deduplicated_errors = []
+        for error_message in combined_errors:
+            if error_message not in seen_errors:
+                seen_errors.add(error_message)
+                deduplicated_errors.append(error_message)
+        checkpoint["errors"] = deduplicated_errors[-500:]
 
         finished_at = datetime.now()
 
@@ -1615,6 +1666,225 @@ class MailboxBackupService:
             f"Exportação completa finalizada: {backup_folders['root']}"
         )
 
+        return result
+
+    @staticmethod
+    def _extract_failed_ids_from_reports(backup_root):
+        pattern = re.compile(r"Erro ao baixar mensagem(?: da pasta [^:]+)?:\s*([^|\s]+)")
+        found = {}
+        candidates = [
+            Path(backup_root) / "audit_report.json",
+            Path(backup_root) / "manifest.json",
+            Path(backup_root) / "checkpoint.json",
+        ]
+        reports_root = Path(backup_root).parent / "_batch_reports"
+        if reports_root.exists():
+            candidates.extend(sorted(reports_root.glob("batch_report_*.json"), reverse=True)[:10])
+        for report_path in candidates:
+            if not report_path.is_file():
+                continue
+            try:
+                data = json.loads(report_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            serialized = json.dumps(data, ensure_ascii=False)
+            for match in pattern.finditer(serialized):
+                message_id = match.group(1).replace("\\n", "").strip()
+                if message_id:
+                    found.setdefault(message_id, {"item_key": message_id, "report_source": str(report_path)})
+        return found
+
+    @staticmethod
+    def _validate_repaired_eml(path):
+        path = Path(path)
+        if not path.is_file() or path.suffix.lower() != ".eml":
+            return False, "O arquivo EML final não existe."
+        size = path.stat().st_size
+        if size <= 0:
+            return False, "O arquivo EML está vazio."
+        with path.open("rb") as handle:
+            header = BytesHeaderParser().parse(handle)
+        if not any(header.get(key) for key in ("Subject", "From", "Date", "Message-ID", "MIME-Version")):
+            return False, "Cabeçalho MIME não reconhecido."
+        return True, None
+
+    def repair_failed_messages(self, backup_root, mailbox_email=None):
+        """Repara somente mensagens ainda falhas, sem enumerar a mailbox inteira."""
+        started = datetime.now()
+        backup_root = Path(backup_root).expanduser().resolve()
+        checkpoint_path = backup_root / "checkpoint.json"
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"checkpoint.json não encontrado: {checkpoint_path}")
+        checkpoint = self.load_json(checkpoint_path)
+        mailbox_email = mailbox_email or checkpoint.get("mailbox")
+        if not mailbox_email:
+            raise ValueError("Mailbox não identificada no checkpoint.")
+        backup_folders = self.create_backup_structure_from_root(backup_root)
+        store = CheckpointStore(
+            path=backup_root / "checkpoint.sqlite3", operation_type="mailbox_backup",
+            source_root=backup_root, destination_path=backup_root
+        )
+        report_candidates = self._extract_failed_ids_from_reports(backup_root)
+        failed_rows = {row["item_key"]: row for row in store.failed_items(retryable_only=False)}
+        for message_id, fallback in report_candidates.items():
+            if store.is_completed(message_id):
+                continue
+            failed_rows.setdefault(message_id, fallback)
+        total = len(failed_rows)
+        result = {
+            "success": False, "mode": "repair_failures", "mailbox": mailbox_email,
+            "backup_path": str(backup_root), "started_at": started.isoformat(),
+            "finished_at": None, "duration_seconds": 0, "found": total,
+            "attempted": 0, "recovered": 0, "reconciled": 0,
+            "still_failed": 0, "items": [], "errors": []
+        }
+        self.logger.info("[REPAIR-EVENT] %s", json.dumps({
+            "stage":"load_failures", "mailbox":mailbox_email, "total":total
+        }, ensure_ascii=False))
+        if not total:
+            result["success"] = True
+        metadata_by_id = {}
+        for index, (message_id, row) in enumerate(failed_rows.items(), 1):
+            self.operation_control.checkpoint()
+            item_started = datetime.now().isoformat()
+            previous_error = row.get("error")
+            original_output = row.get("output_path")
+            folder_id = row.get("folder_id")
+            if original_output:
+                prior_path = Path(original_output)
+                try:
+                    valid, _ = self._validate_repaired_eml(prior_path)
+                except Exception:
+                    valid = False
+                if valid:
+                    size = prior_path.stat().st_size
+                    store.mark_completed(message_id, folder_id=folder_id,
+                        output_path=str(prior_path), bytes_written=size,
+                        verification_status="reconciled")
+                    store.record_repair(message_id, True, previous_error=previous_error,
+                        folder_id=folder_id, original_output_path=original_output,
+                        final_output_path=str(prior_path), bytes_written=size,
+                        diagnostic={"stage":"reconciled_existing"}, started_at=item_started)
+                    result["reconciled"] += 1
+                    result["items"].append({"message_id":message_id,"success":True,
+                        "action":"reconciled","path":str(prior_path)})
+                    current = result["recovered"] + result["reconciled"]
+                    self.logger.info("[REPAIR-PROGRESS] %s", json.dumps({
+                        "mailbox":mailbox_email,"current":current,"total":total,
+                        "recovered":result["recovered"],"reconciled":result["reconciled"],
+                        "failed":index-current,"stage":"reconciled"
+                    }, ensure_ascii=False, separators=(",",":")))
+                    continue
+            result["attempted"] += 1
+            meta_result = self.graph_service.get_message_by_id(mailbox_email, message_id)
+            message = meta_result.get("data") if meta_result.get("success") else {"id": message_id}
+            message = message if isinstance(message, dict) else {"id": message_id}
+            message.setdefault("id", message_id)
+            if not folder_id:
+                folder_id = message.get("parentFolderId")
+            if original_output:
+                destination = Path(original_output)
+                if destination.suffix.lower() == ".part":
+                    destination = destination.with_suffix("")
+            else:
+                folder_path = "Falhas recuperadas"
+                destination_dir = self.build_folder_local_path(
+                    backup_folders["mail_folders"], folder_path) / "eml"
+                destination = destination_dir / self.build_message_filename(index, message)
+            store.mark_processing(message_id, folder_id=folder_id, output_path=str(destination))
+            download = self.graph_service.download_message_mime_to_file(
+                mailbox_email, message_id, destination
+            )
+            actual_path = Path(download.get("path") or destination)
+            valid = False
+            validation_error = None
+            if download.get("success"):
+                try:
+                    valid, validation_error = self._validate_repaired_eml(actual_path)
+                except Exception as error:
+                    validation_error = str(error)
+            if download.get("success") and valid:
+                size = actual_path.stat().st_size
+                store.mark_completed(message_id, folder_id=folder_id,
+                    output_path=str(actual_path), bytes_written=size,
+                    verification_status="repaired")
+                store.record_repair(message_id, True, previous_error=previous_error,
+                    folder_id=folder_id, original_output_path=original_output,
+                    final_output_path=str(actual_path), bytes_written=size,
+                    diagnostic=download.get("diagnostic"), started_at=item_started)
+                result["recovered"] += 1
+                result["items"].append({"message_id":message_id,"success":True,
+                    "action":"downloaded","path":str(actual_path),"bytes_written":size})
+            else:
+                error = validation_error or download.get("error") or "Falha não identificada."
+                diagnostic = download.get("diagnostic") or {"stage":"validate_final"}
+                store.mark_failed(message_id, error, folder_id=folder_id, output_path=str(destination))
+                store.record_repair(message_id, False, previous_error=previous_error,
+                    new_error=error, folder_id=folder_id,
+                    original_output_path=original_output, final_output_path=None,
+                    diagnostic=diagnostic, started_at=item_started)
+                result["still_failed"] += 1
+                result["errors"].append(f"{message_id} | {error}")
+                result["items"].append({"message_id":message_id,"success":False,
+                    "error":error,"diagnostic":diagnostic})
+                self.logger.error("[ROOT-CAUSE] %s", json.dumps({
+                    "mode":"repair_failures","mailbox":mailbox_email,
+                    "message_id":message_id,"download":download,
+                    "validation_error":validation_error
+                }, ensure_ascii=False))
+            current = result["recovered"] + result["reconciled"] + result["still_failed"]
+            self.logger.info("[REPAIR-PROGRESS] %s", json.dumps({
+                "mailbox":mailbox_email,"current":current,"total":total,
+                "recovered":result["recovered"],"reconciled":result["reconciled"],
+                "failed":result["still_failed"],"stage":"repairing"
+            }, ensure_ascii=False, separators=(",",":")))
+        counts = store.counts()
+        checkpoint["exported_message_count"] = int(counts.get("completed", 0) or 0)
+        checkpoint["failed_message_count"] = int(counts.get("failed", 0) or 0)
+        checkpoint["downloaded_bytes"] = int(counts.get("bytes_written", 0) or 0)
+        expected = int(checkpoint.get("expected_message_count", 0) or 0)
+        completed = checkpoint["exported_message_count"]
+        checkpoint["full_scan_verified"] = bool(
+            checkpoint.get("enumeration_matches_expected", False)
+            and completed >= expected and checkpoint["failed_message_count"] == 0
+            and int(counts.get("processing", 0) or 0) == 0
+        )
+        checkpoint["status"] = "completed" if checkpoint["full_scan_verified"] else "incomplete"
+        checkpoint["last_repair_at"] = datetime.now().isoformat()
+        result["success"] = result["still_failed"] == 0
+        result["active_failures_after"] = checkpoint["failed_message_count"]
+        result["completed_accumulated"] = completed
+        finished = datetime.now()
+        result["finished_at"] = finished.isoformat()
+        result["duration_seconds"] = round((finished-started).total_seconds(), 2)
+        reports_dir = backup_root / "repair_reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        stamp = finished.strftime("%Y%m%d_%H%M%S")
+        report_path = reports_dir / f"repair_report_{stamp}.json"
+        self.save_json(report_path, result)
+        self.save_json(reports_dir / "latest_repair_report.json", result)
+        self.save_checkpoint(backup_folders, checkpoint)
+        summary = {
+            "messages_exported_this_run": 0,
+            "messages_repaired_this_run": result["recovered"],
+            "messages_reconciled_this_run": result["reconciled"],
+            "messages_completed_accumulated": completed,
+            "messages_failed_active": checkpoint["failed_message_count"],
+        }
+        for name in ("manifest.json", "audit_report.json"):
+            path = backup_root / name
+            if path.is_file():
+                try:
+                    data = self.load_json(path)
+                    data["success"] = checkpoint["full_scan_verified"]
+                    data["repair_summary"] = summary
+                    data["last_repair_report"] = str(report_path)
+                    self.save_json(path, data)
+                except Exception as error:
+                    self.logger.warning("Não foi possível atualizar %s: %s", name, error)
+        if checkpoint["full_scan_verified"]:
+            (backup_root / "backup_completed.ok").write_text(finished.isoformat(), encoding="utf-8")
+        self.logger.info("[REPAIR-SUMMARY] %s", json.dumps(result, ensure_ascii=False, separators=(",",":")))
         return result
 
     def export_message_attachments(
@@ -2148,6 +2418,8 @@ class MailboxBackupService:
                         f"Falha na mailbox {mailbox_email}"
                     )
 
+            except OperationInterrupted:
+                raise
             except Exception as error:
                 self.logger.error(
                     f"Erro inesperado ao processar {mailbox_email}: {error}"

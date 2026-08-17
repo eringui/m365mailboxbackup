@@ -1,12 +1,14 @@
 import argparse
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import psutil
@@ -18,6 +20,10 @@ try:
     from src.services.operation_store import OperationStore
 except ImportError:
     from operation_store import OperationStore  # pyright: ignore[reportMissingImports]
+try:
+    from application_runtime import CredentialStore
+except ImportError:
+    from .application_runtime import CredentialStore
 
 HOST = "127.0.0.1"
 PORT = 8765
@@ -25,6 +31,26 @@ PORT = 8765
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def setup_coordinator_logger(project_root):
+    """Create a rotating file-only logger for the coordinator process."""
+    logs_dir = Path(os.getenv("M365_LOGS_ROOT", str(Path(project_root) / "logs"))).expanduser().resolve()
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("m365_mailbox_backup.coordinator")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        handler = RotatingFileHandler(
+            logs_dir / "coordinator.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        )
+        logger.addHandler(handler)
+    return logger
 
 
 class OperationCreate(BaseModel):
@@ -52,6 +78,7 @@ class Coordinator:
         self.state_dir = self.project_root / "_gui_state"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.store = OperationStore(self.state_dir / "operations.sqlite3")
+        self.credential_store = CredentialStore(self.project_root)
         self.processes = {}
         self.process_lock = threading.RLock()
         self.stop_event = threading.Event()
@@ -73,12 +100,17 @@ class Coordinator:
         for operation_id, process in processes:
             if process.poll() is not None:
                 continue
-            self.store.update_operation(
-                operation_id,
-                status="pausing",
-                pause_requested=True,
-                heartbeat_at=utc_now()
+            operation = self.store.get_operation(operation_id)
+            already_cancelling = bool(
+                operation and operation.get("cancel_requested")
             )
+            if not already_cancelling:
+                self.store.update_operation(
+                    operation_id,
+                    status="pausing",
+                    pause_requested=True,
+                    heartbeat_at=utc_now()
+                )
             self._event(
                 operation_id,
                 "application_closing",
@@ -240,6 +272,21 @@ class Coordinator:
         environment = os.environ.copy()
         runtime_environment = self._validated_runtime_environment(operation.get("options") or {})
         environment.update(runtime_environment)
+
+        # The coordinator is a separate executable and may have been started before
+        # credentials were saved or updated in the GUI. Load the protected values for
+        # every child process instead of depending on the coordinator's inherited
+        # environment. Secrets are injected only into the child process environment;
+        # they are never persisted in operation options, events or logs.
+        protected_credentials = self.credential_store.load()
+        credential_environment = {
+            "TENANT_ID": str(protected_credentials.get("tenant_id") or ""),
+            "CLIENT_ID": str(protected_credentials.get("client_id") or ""),
+            "CLIENT_SECRET": str(protected_credentials.get("client_secret") or ""),
+        }
+        if all(credential_environment.values()):
+            environment.update(credential_environment)
+
         environment["PYTHONIOENCODING"] = "utf-8"
         environment["PYTHONUTF8"] = "1"
         environment["M365_OPERATION_ID"] = operation_id
@@ -281,7 +328,8 @@ class Coordinator:
                 payload={
                     "pid": process.pid, "resume": is_resume,
                     "runtime_settings_applied": bool(runtime_environment),
-                    "runtime_environment": runtime_environment
+                    "runtime_environment": runtime_environment,
+                    "protected_credentials_applied": all(credential_environment.values())
                 }
             )
             threading.Thread(
@@ -306,9 +354,8 @@ class Coordinator:
                 if not operation:
                     continue
                 if operation["pause_requested"] and process.poll() is None:
+                    # A thread de prazo da pausa controla o fallback. Não matar ao receber stdout.
                     self.store.update_operation(operation_id, status="pausing")
-                    self._event(operation_id, "operation_pausing", message="Pausa solicitada; salvando o ponto atual.")
-                    process.terminate()
                 elif operation["cancel_requested"] and process.poll() is None:
                     process.terminate()
             code = process.wait()
@@ -316,6 +363,15 @@ class Coordinator:
             code = -1
             self._event(operation_id, "monitor_failed", "error",
                         "Falha ao acompanhar a operação.", str(error))
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
         finally:
             with self.process_lock:
                 self.processes.pop(operation_id, None)
@@ -375,6 +431,8 @@ class Coordinator:
             (("retomada paginada", "continuando diretamente"), "Recuperando página pendente"),
             (("exportando pasta", "enumeração integral"), "Preparando mensagens pendentes"),
             (("[ok] eml salvo",), "Baixando EML novamente"),
+            (("[repair-event]",), "Lendo falhas do checkpoint"),
+            (("[repair-progress]",), "Corrigindo somente falhas"),
             (("preparação mime paralela", "preparacao mime paralela"), "Preparando EML em paralelo"),
             (("primeiro eml de continuação confirmado",), "Primeiro EML confirmado no PST")
         )
@@ -388,7 +446,7 @@ class Coordinator:
                     payload={"stage": stage}
                 )
                 break
-        for marker in ("[PROGRESS] ", "[PST-PROGRESS] "):
+        for marker in ("[PROGRESS] ", "[PST-PROGRESS] ", "[REPAIR-PROGRESS] "):
             if marker in line:
                 try:
                     payload = json.loads(line.split(marker, 1)[1].strip())
@@ -397,15 +455,38 @@ class Coordinator:
                     pipeline = payload.get("pipeline") or {}
                     resume_metrics = payload.get("resume") or {}
                     options = (self.store.get_operation(operation_id) or {}).get("options") or {}
+                    previous = self.store.get_operation(operation_id) or {}
+                    raw_current = payload.get("current")
+                    raw_expected = payload.get("expected")
+                    raw_total = payload.get("total")
+                    incoming_total = raw_expected if raw_expected not in (None, "", 0, "0") else raw_total
+                    progress_fields = {
+                        "current_items": max(
+                            int(previous.get("current_items", 0) or 0),
+                            int(raw_current or 0),
+                        ),
+                        "total_items": max(
+                            int(previous.get("total_items", 0) or 0),
+                            int(incoming_total or 0),
+                            int(raw_current or 0),
+                        ),
+                    }
+                    if "failed" in payload:
+                        progress_fields["failed_items"] = int(payload.get("failed") or 0)
+                    if "downloaded_bytes" in payload:
+                        progress_fields["downloaded_bytes"] = max(
+                            int(previous.get("downloaded_bytes", 0) or 0),
+                            int(payload.get("downloaded_bytes") or 0),
+                        )
+                    if payload.get("folder") is not None:
+                        progress_fields["current_folder"] = payload.get("folder")
+                    if payload.get("page") is not None:
+                        progress_fields["current_page"] = int(payload.get("page") or 0)
+                    if payload.get("sync_mode") is not None:
+                        progress_fields["sync_mode"] = payload.get("sync_mode")
                     self.store.heartbeat(
                         operation_id,
-                        current_items=int(payload.get("current", 0) or 0),
-                        total_items=int(payload.get("expected", payload.get("total", 0)) or 0),
-                        failed_items=int(payload.get("failed", 0) or 0),
-                        downloaded_bytes=int(payload.get("downloaded_bytes", 0) or 0),
-                        current_folder=payload.get("folder"),
-                        current_page=int(payload.get("page", 0) or 0),
-                        sync_mode=payload.get("sync_mode"),
+                        **progress_fields,
                         rate_limiter_enabled=bool(limiter.get("enabled", False)),
                         rate_limiter_profile=limiter.get("profile"),
                         rate_limiter_wait_seconds=float(limiter.get("wait_seconds", 0) or 0),
@@ -452,7 +533,7 @@ class Coordinator:
                     current_value = int(payload.get("current", 0) or 0)
                     last_at = float(self._last_progress_event_at.get(operation_id, 0.0))
                     last_value = int(self._last_progress_event_value.get(operation_id, -1))
-                    total_value = int(payload.get("expected", payload.get("total", 0)) or 0)
+                    total_value = int(progress_fields.get("total_items", 0) or 0)
                     important = current_value == total_value and total_value > 0
                     if important or current_value != last_value and now - last_at >= 0.75:
                         self._last_progress_event_at[operation_id] = now
@@ -468,21 +549,40 @@ class Coordinator:
             self._event(operation_id, "operation_log_error", "error",
                         "O processo informou um problema.", line)
 
-    def _force_pause_deadline(self, operation_id, process, deadline_seconds=12.0):
-        deadline = time.monotonic() + max(1.0, float(deadline_seconds))
-        while process.poll() is None and time.monotonic() < deadline:
+    def _force_pause_deadline(self, operation_id, process, cooperative_seconds=8.0, terminate_seconds=4.0):
+        cooperative_deadline = time.monotonic() + max(1.0, float(cooperative_seconds))
+        while process.poll() is None and time.monotonic() < cooperative_deadline:
             time.sleep(0.20)
         if process.poll() is None:
             self._event(
-                operation_id,
-                "pause_deadline_reached",
-                "warning",
+                operation_id, "pause_cooperative_deadline", "warning",
+                "O processo não encerrou cooperativamente; enviando sinal de término."
+            )
+            try:
+                process.terminate()
+            except Exception:
+                pass
+        hard_deadline = time.monotonic() + max(1.0, float(terminate_seconds))
+        while process.poll() is None and time.monotonic() < hard_deadline:
+            time.sleep(0.20)
+        if process.poll() is None:
+            self._event(
+                operation_id, "pause_deadline_reached", "warning",
                 "O processo excedeu o limite de pausa e será interrompido agora."
             )
             try:
+                parent = psutil.Process(process.pid)
+                for child in parent.children(recursive=True):
+                    try:
+                        child.kill()
+                    except Exception:
+                        pass
                 process.kill()
             except Exception:
-                pass
+                try:
+                    process.kill()
+                except Exception:
+                    pass
 
     def pause(self, operation_id):
         operation = self.store.get_operation(operation_id)
@@ -516,19 +616,9 @@ class Coordinator:
                 status="pausing",
                 heartbeat_at=utc_now()
             )
-            try:
-                process.terminate()
-            except Exception as error:
-                self._event(
-                    operation_id,
-                    "pause_signal_failed",
-                    "warning",
-                    "O primeiro sinal de pausa falhou; o limite de segurança continuará ativo.",
-                    str(error)
-                )
             threading.Thread(
                 target=self._force_pause_deadline,
-                args=(operation_id, process, 12.0),
+                args=(operation_id, process, 8.0, 4.0),
                 daemon=True
             ).start()
         return self.store.get_operation(operation_id)
@@ -558,21 +648,73 @@ class Coordinator:
         threading.Thread(target=self.start_queued, daemon=True).start()
         return result
 
+    def _force_cancel_deadline(self, operation_id, process, deadline_seconds=12.0):
+        deadline = time.monotonic() + max(1.0, float(deadline_seconds))
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.20)
+        if process.poll() is None:
+            self._event(
+                operation_id,
+                "cancel_deadline_reached",
+                "warning",
+                "O processo excedeu o limite de cancelamento e será finalizado agora."
+            )
+            try:
+                process.kill()
+            except Exception:
+                pass
+
     def cancel(self, operation_id):
         operation = self.store.get_operation(operation_id)
         if not operation:
             raise KeyError(operation_id)
         if operation["status"] == "queued":
-            return self.store.update_operation(operation_id, status="cancelled", finished_at=utc_now())
-        return self.store.request_cancel(operation_id)
+            return self.store.update_operation(
+                operation_id, status="cancelled", finished_at=utc_now()
+            )
+        result = self.store.request_cancel(operation_id)
+        self._event(
+            operation_id,
+            "operation_cancel_requested",
+            message="Cancelamento solicitado; interrompendo o processo em até 12 segundos."
+        )
+        with self.process_lock:
+            process = self.processes.get(operation_id)
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except Exception as error:
+                self._event(
+                    operation_id,
+                    "cancel_signal_failed",
+                    "warning",
+                    "O primeiro sinal de cancelamento falhou; o limite de segurança continuará ativo.",
+                    str(error)
+                )
+            threading.Thread(
+                target=self._force_cancel_deadline,
+                args=(operation_id, process, 12.0),
+                daemon=True
+            ).start()
+        return result
 
     def _scheduler_loop(self):
+        last_error_logged_at = 0.0
         while not self.stop_event.is_set():
             try:
                 self.start_queued()
                 self._check_processes()
-            except Exception:
-                pass
+            except Exception as error:
+                now = time.monotonic()
+                if now - last_error_logged_at > 5.0:
+                    last_error_logged_at = now
+                    self._event(
+                        None,
+                        "scheduler_error",
+                        "error",
+                        "Falha no ciclo do agendador de operações.",
+                        str(error)
+                    )
             self.stop_event.wait(0.75)
 
     def _check_processes(self):
@@ -610,7 +752,10 @@ def operations():
 
 @app.post("/api/v1/operations")
 def create_operation(request: OperationCreate):
-    return coordinator.create(request)
+    try:
+        return coordinator.create(request)
+    except ValueError as error:
+        raise HTTPException(400, str(error))
 
 
 @app.post("/api/v1/operations/{operation_id}/pause")
@@ -707,13 +852,20 @@ def main():
     args = parser.parse_args()
     if args.host not in ("127.0.0.1", "localhost"):
         raise SystemExit("O coordenador aceita somente conexão local.")
+    coordinator_logger = setup_coordinator_logger(PROJECT_ROOT)
     coordinator.watch_parent(args.parent_pid)
     config = uvicorn.Config(
-        app, host="127.0.0.1", port=args.port,
+        app, host=args.host, port=args.port,
         log_level="warning", workers=1
     )
     server_instance = uvicorn.Server(config)
-    server_instance.run()
+    try:
+        server_instance.run()
+    except Exception as error:
+        coordinator_logger.error(
+            f"Falha ao iniciar o coordenador em {args.host}:{args.port}: {error}"
+        )
+        raise
 
 
 if __name__ == "__main__":

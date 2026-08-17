@@ -22,11 +22,15 @@ class OperationStore:
     def connection(self):
         connection = getattr(self._local, "connection", None)
         if connection is None:
-            connection = sqlite3.connect(str(self.path), timeout=3, isolation_level=None)
+            # timeout/busy_timeout generosos: até 20 backups + PSTs concorrentes
+            # escrevem heartbeats no mesmo arquivo SQLite a cada poucos segundos,
+            # e o arquivo pode estar sob uma pasta sincronizada (OneDrive) onde
+            # locks são mais demorados para liberar do que em disco local puro.
+            connection = sqlite3.connect(str(self.path), timeout=15, isolation_level=None)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=NORMAL")
-            connection.execute("PRAGMA busy_timeout=3000")
+            connection.execute("PRAGMA busy_timeout=15000")
             self._local.connection = connection
         return connection
 
@@ -180,7 +184,7 @@ class OperationStore:
         if self.get_setting("backup_concurrency") is None:
             self.set_setting("backup_concurrency", 2)
         if self.get_setting("pst_concurrency") is None:
-            self.set_setting("pst_concurrency", 0)
+            self.set_setting("pst_concurrency", 1)
 
     def create_operation(self, operation_type, command, mailbox=None, source_path=None,
                          destination_path=None, backup_path=None, options=None,
@@ -293,18 +297,28 @@ class OperationStore:
         return self.update_operation(operation_id, pause_requested=False, cancel_requested=False)
 
     def set_queue_order(self, operation_ids):
-        with self.connection() as connection:
+        # A conexão usa isolation_level=None (autocommit): sem um BEGIN
+        # explícito, cada UPDATE já comita sozinho e uma falha no meio do
+        # laço deixaria a fila parcialmente reordenada.
+        connection = self.connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
             for position, operation_id in enumerate(operation_ids, 1):
                 connection.execute(
                     "UPDATE operations SET queue_position = ?, updated_at = ? WHERE operation_id = ?",
                     (position, utc_now(), str(operation_id))
                 )
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
         return self.list_operations()
 
     def delete_operation(self, operation_id):
         operation = self.get_operation(operation_id)
         if not operation or operation["status"] in (
-            "running", "starting", "pausing", "pause_requested", "queued"
+            "running", "starting", "pausing", "pause_requested",
+            "cancel_requested", "queued"
         ):
             return False
         self.connection().execute("DELETE FROM operations WHERE operation_id = ?", (operation_id,))
