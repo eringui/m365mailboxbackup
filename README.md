@@ -145,7 +145,7 @@ M365_BACKUP_OUTPUT_ROOT=./output/backups
 
 > In the GUI, credentials can also be stored securely using **DPAPI** (`_gui_state/credentials.bin`) through the settings screen, without requiring a `.env`.
 
-Some advanced variables (all optional, with sensible default values):
+Some advanced variables (all optional, with sensible default values.):
 
 | Variável | Padrão | Description |
 |---|---|---|
